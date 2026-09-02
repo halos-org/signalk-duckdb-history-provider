@@ -12,6 +12,7 @@ import {
 import { sqlLiteral } from "../duckdb/sql.js";
 import {
   dateDirectoryStart,
+  liveTreeFiles,
   sidecarFile,
   treeRoot,
 } from "../roll/tree-path.js";
@@ -610,7 +611,10 @@ export function treeFilesInRange(
     } catch {
       continue; // Removed between the two reads, by expiry or by hand.
     }
-    for (const name of names.sort()) {
+    // A compacted file supersedes the rolls it folded in, and the merge
+    // unlinks those afterwards rather than atomically with its own rename.
+    // Reading both would answer every row in the hour twice.
+    for (const name of liveTreeFiles(names).sort()) {
       if (!name.endsWith(".parquet")) continue;
       found.push({ day, name, path: join(directory, name) });
     }

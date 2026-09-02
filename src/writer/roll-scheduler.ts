@@ -30,6 +30,21 @@ import type { HotStore } from "./hot-store.js";
  */
 
 const ROLL_ENTRY = fileURLToPath(new URL("../roll/main.js", import.meta.url));
+const COMPACT_ENTRY = fileURLToPath(
+  new URL("../compact/main.js", import.meta.url),
+);
+
+/** Milliseconds in the hour a compaction covers. */
+const HOUR_MS = 3_600_000;
+
+/**
+ * How long a compaction gets before it is killed.
+ *
+ * Shorter than a roll's, because nothing waits on it: a merge that overruns
+ * costs disk and some query time, while a roll that overruns never truncates
+ * and the store grows without bound.
+ */
+const COMPACT_TIMEOUT_MS = 5 * 60_000;
 
 /**
  * How long a roll gets before it is killed.
@@ -68,6 +83,13 @@ export interface RollSchedulerOptions {
   now?: () => number;
   /** Injected in tests, so a roll need not be a real DuckDB process. */
   spawnRoll?: (args: string[]) => ChildProcess;
+  /** Injected in tests, so a compaction need not be a real DuckDB process. */
+  spawnCompact?: (args: string[]) => ChildProcess;
+  /**
+   * Merge each completed hour's rolls into one file sorted by path. Off makes
+   * the tree exactly what it was before compaction existed.
+   */
+  compactHourly?: boolean;
   /** Injected in tests. Production waits ROLL_TIMEOUT_MS. */
   timeoutMs?: number;
   /** Injected in tests. Production waits START_ROLL_DELAY_MS. */
@@ -297,6 +319,7 @@ export class RollScheduler {
       `roll ${rollId} wrote ${outcome.summary}; ${removed} rows truncated`,
     );
     this.reportExpiry(outcome.result);
+    await this.compactClosedHour(slot);
   }
 
   /**
@@ -334,6 +357,94 @@ export class RollScheduler {
         ? `roll failed: ${problem.message}`
         : String(problem);
     (this.options.onError ?? this.options.log)(line);
+  }
+
+  /**
+   * Merge the hour this roll just closed, if it closed one.
+   *
+   * Runs here rather than on a timer of its own so it inherits the scheduler's
+   * serialisation: one child at a time, and never beside the roll whose files
+   * it is about to read. It runs only once the pending-roll record is cleared,
+   * which is what keeps the seam correct -- `rolledOverlap` resolves a pending
+   * roll by looking for `<rollId>.parquet`, and a merge that renamed those
+   * rows under a new name while the record still pointed at the old one would
+   * make the seam conclude the tree does not hold them.
+   *
+   * A failure is logged and nothing else. The merge touches no hot store row,
+   * so there is nothing here that can cost recording.
+   */
+  private async compactClosedHour(slot: number): Promise<void> {
+    if (this.options.compactHourly === false) return;
+    if (this.stopped) return;
+    // A backlog roll is named for the instant it ran, not for a slot, so it
+    // closes no hour. The next boundary catches up.
+    if (slot % HOUR_MS !== 0) return;
+    if (this.pending !== null) return;
+
+    const hour = slot - HOUR_MS;
+    const outcome = await this.runCompaction(hour);
+    if (outcome.ok) {
+      if (outcome.summary !== null) this.options.log(outcome.summary);
+      return;
+    }
+    this.reportFailure(
+      `compacting the hour starting ${hour} did not finish (${outcome.why}); ` +
+        `its rolls are untouched and still answer every query`,
+    );
+  }
+
+  private runCompaction(
+    hour: number,
+  ): Promise<
+    { ok: true; summary: string | null } | { ok: false; why: string }
+  > {
+    const args = [
+      COMPACT_ENTRY,
+      "--data-dir",
+      this.options.dataDir,
+      "--hour",
+      String(hour),
+    ];
+    const child = (this.options.spawnCompact ?? defaultSpawn)(args);
+    this.running = child;
+
+    return new Promise((resolve) => {
+      let out = "";
+      let err = "";
+      let settled = false;
+      const settle = (
+        result:
+          { ok: true; summary: string | null } | { ok: false; why: string },
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(killer);
+        this.running = null;
+        resolve(result);
+      };
+      child.stdout?.on("data", (chunk: Buffer) => (out += chunk.toString()));
+      child.stderr?.on("data", (chunk: Buffer) => (err += chunk.toString()));
+      child.stdout?.on("error", () => {});
+      child.stderr?.on("error", () => {});
+      child.on("error", (error) =>
+        settle({ ok: false, why: (error as Error).message }),
+      );
+      const killer = setTimeout(() => {
+        child.kill("SIGKILL");
+        settle({ ok: false, why: `it ran past ${COMPACT_TIMEOUT_MS} ms` });
+      }, this.options.timeoutMs ?? COMPACT_TIMEOUT_MS);
+      killer.unref();
+      child.on("exit", (code) => {
+        if (code !== 0) {
+          settle({
+            ok: false,
+            why: err.trim() || `it exited ${String(code)}`,
+          });
+          return;
+        }
+        settle({ ok: true, summary: summariseCompaction(out) });
+      });
+    });
   }
 
   private runRoll(
@@ -579,4 +690,34 @@ function describe(result: RollSummary): string {
       ? `, expiring ${result.expired.join(", ")}`
       : "";
   return `${result.rows} rows to ${dates} and ${result.sidecarRows} sidecar rows${peak}${expired}`;
+}
+
+/**
+ * One line about what a merge did, or null when it did nothing.
+ *
+ * Parsed rather than trusted: the process prints JSON on success, and a build
+ * mismatch or a truncated pipe should read as "no summary" rather than as an
+ * exception inside the scheduler.
+ */
+function summariseCompaction(stdout: string): string | null {
+  try {
+    const parsed = JSON.parse(stdout.trim().split("\n").pop() ?? "") as {
+      hourStartMs?: number;
+      files?: { rows: number; bytesIn: number; bytesOut: number }[];
+      strayInputs?: string[];
+    };
+    const files = parsed.files ?? [];
+    if (files.length === 0) return null;
+    const rows = files.reduce((sum, file) => sum + file.rows, 0);
+    const bytesIn = files.reduce((sum, file) => sum + file.bytesIn, 0);
+    const bytesOut = files.reduce((sum, file) => sum + file.bytesOut, 0);
+    const stray = parsed.strayInputs?.length ?? 0;
+    return (
+      `compacted the hour starting ${parsed.hourStartMs ?? "?"}: ` +
+      `${files.length} file(s), ${rows} rows, ${bytesIn} -> ${bytesOut} bytes` +
+      (stray > 0 ? `; ${stray} input(s) could not be removed` : "")
+    );
+  } catch {
+    return null;
+  }
 }

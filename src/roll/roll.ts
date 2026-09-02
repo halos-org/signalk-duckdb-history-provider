@@ -73,7 +73,7 @@ const DAY_MS = 86_400_000;
 export const DEFAULT_MEMORY_LIMIT = "256MB";
 
 /** Columns the tree carries, in the order every file writes them. */
-const COLUMN_LIST = [
+export const COLUMN_LIST = [
   "ts",
   "context",
   "path",

@@ -148,3 +148,102 @@ export function assertUnderDataDir(dataDir: string, path: string): string {
   }
   return candidate;
 }
+
+/**
+ * One compacted hour's file for one date.
+ *
+ * **The `hour-` prefix is not decoration.** `rolledOverlap` resolves the seam
+ * by looking for `<rollId>.parquet` in a date directory, so a merged file
+ * named with a bare number could be mistaken for the output of the roll whose
+ * id it matched — and the seam would then subtract rows the merge had already
+ * folded in. The two name spaces have to stay apart. `treeFilesInRange` globs
+ * `*.parquet` and reads both kinds without caring which is which.
+ *
+ * Named for the hour it covers rather than for the instant the merge ran, so
+ * a retry after a failure writes the same name and replaces its own output
+ * rather than accumulating a second copy under a new one.
+ */
+export function compactedFile(
+  dataDir: string,
+  ts: number,
+  hourStartMs: number,
+): string {
+  return assertUnderDataDir(
+    dataDir,
+    join(
+      dateDirectory(dataDir, ts),
+      `${COMPACTED_PREFIX}${rollIdSegment(hourStartMs)}.parquet`,
+    ),
+  );
+}
+
+/** Where a merge writes before it renames, for the reason `rollTempFile` gives. */
+export function compactedTempFile(
+  dataDir: string,
+  ts: number,
+  hourStartMs: number,
+): string {
+  return `${compactedFile(dataDir, ts, hourStartMs)}.tmp`;
+}
+
+const COMPACTED_PREFIX = "hour-";
+
+/**
+ * The roll id a file name carries, or null when the name is not a roll's.
+ *
+ * Compaction chooses its inputs by id rather than by the timestamps inside
+ * them: a roll places each row in the date directory that row's own timestamp
+ * names, so a set chosen by content could only be found by opening every file.
+ * A compacted file is deliberately not a roll and returns null here, which is
+ * what stops a second pass from folding one merge into another.
+ */
+export function rollIdFromName(name: string): number | null {
+  if (!name.endsWith(".parquet")) return null;
+  const stem = name.slice(0, -".parquet".length);
+  if (!/^[0-9]+$/.test(stem)) return null;
+  const id = Number(stem);
+  return Number.isSafeInteger(id) && id >= 1 ? id : null;
+}
+
+/** The hour a compacted file covers, or null when the name is not one. */
+export function compactedHourFromName(name: string): number | null {
+  if (!name.startsWith(COMPACTED_PREFIX) || !name.endsWith(".parquet")) {
+    return null;
+  }
+  const stem = name.slice(COMPACTED_PREFIX.length, -".parquet".length);
+  if (!/^[0-9]+$/.test(stem)) return null;
+  const hour = Number(stem);
+  return Number.isSafeInteger(hour) && hour >= 1 ? hour : null;
+}
+
+/**
+ * The files in one date directory a reader should read.
+ *
+ * **This is what makes compaction safe without a window.** A merge cannot
+ * rename its output in and then unlink its inputs — between those two the
+ * directory holds both and every row in the hour is answered twice — and it
+ * cannot unlink first either, because then the hour is missing until the
+ * rename lands. Neither order is atomic across a set of files.
+ *
+ * So the merge does not try. It renames its output into place, which is atomic
+ * for that one file, and from that instant this function stops returning the
+ * rolls it superseded. The inputs are unlinked afterwards at no particular
+ * moment, and a merge killed before it gets to them leaves files that are
+ * ignored rather than files that are wrong.
+ *
+ * `HOUR_MS` is spelled here rather than imported so the tree's naming rules
+ * stay free of the compaction module; `compact/plan.ts` re-exports the same
+ * constant and `coversHour` is its inverse.
+ */
+export function liveTreeFiles(names: string[]): string[] {
+  const hours: number[] = [];
+  for (const name of names) {
+    const hour = compactedHourFromName(name);
+    if (hour !== null) hours.push(hour);
+  }
+  return names.filter((name) => {
+    const id = rollIdFromName(name);
+    if (id === null) return true;
+    return !hours.some((hour) => id > hour && id <= hour + 3_600_000);
+  });
+}

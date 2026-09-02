@@ -53,7 +53,7 @@ async function main(): Promise<void> {
   if (dataDir === undefined || dataDir === "") {
     writeStderr(
       "usage: writer/main.js --data-dir <path> --roll-interval-minutes <n> " +
-        "[--retention-days <n>]\n",
+        "[--retention-days <n>] [--no-compact]\n",
     );
     process.exit(1);
   }
@@ -131,6 +131,10 @@ async function main(): Promise<void> {
     dataDir,
     intervalMinutes: rollIntervalMinutes,
     retentionDays: retentionUsable,
+    // Present-means-off, like --replace on the roll: the plugin passes the
+    // flag only when an operator turned compaction off, so a writer started
+    // by an older plugin compacts, which is the default.
+    compactHourly: !process.argv.includes("--no-compact"),
     log: (line) => process.stdout.write(`${line}\n`),
     // stderr, because the plugin routes it to app.error while stdout goes to
     // app.debug. A roll failure nobody sees is the shape this whole design

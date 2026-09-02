@@ -22,6 +22,7 @@ const complete: Config = {
   dataDir: "/var/lib/history",
   retentionDays: 30,
   rollIntervalMinutes: 15,
+  compactHourly: false,
 };
 
 describe("ConfigSchema", () => {
@@ -30,6 +31,7 @@ describe("ConfigSchema", () => {
     // form field the operator can never set.
     const properties = Object.keys(ConfigSchema.properties);
     assert.deepEqual(properties.sort(), [
+      "compactHourly",
       "dataDir",
       "defaultSamplingRate",
       "flushBatchSize",
@@ -93,6 +95,7 @@ describe("ConfigSchema", () => {
       retentionDays: (ConfigSchema.properties.retentionDays as any).default,
       rollIntervalMinutes: (ConfigSchema.properties.rollIntervalMinutes as any)
         .default,
+      compactHourly: (ConfigSchema.properties.compactHourly as any).default,
     };
     assert.deepEqual(declared, { ...CONFIG_DEFAULTS });
   });
