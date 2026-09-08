@@ -178,7 +178,23 @@ tree twice. It refuses if anything answers on the writer's socket.
 ./run bench compare control.json sqhp.json parquet.json
 ./run bench selftest
 ./run bench roll --data-dir /path/to/a/copy --max-rowid 1267241
+./run bench query --data-dir /path/to/a/tree --from 1788825600000 --to 1788829200000
+./run bench http-query --provider signalk-questdb-history-provider \
+  --from 2026-09-08T06:00:00Z --to 2026-09-08T07:00:00Z \
+  --path navigation.speedOverGround --resolution 60
 ```
+
+`query` and `http-query` time different things. `query` runs a request through
+this plugin's own DuckDB reader against a tree on disk, which is the engine's
+cost with no server in the way. `http-query` times a round trip over the Signal
+K v2 history route, addressed to one provider by plugin id — so it works against
+any provider the server has registered, not only this one, and it includes the
+plugin's own assembly of the answer. That route is the only surface on which
+providers backed by different engines answer the same question, which makes it
+the one to compare them on. Run it on the device: a round trip measured across a
+network measures the network. It checks the server's `_providers` list before
+timing anything, so a misspelled plugin id fails rather than quietly measuring
+whichever provider is the default.
 
 `selftest` measures a load generator with a known duty cycle and compares the
 harness's numbers against the generator's own accounting — it counted the bytes
