@@ -7,6 +7,7 @@
  *   node dist/bench/cli.js roll --data-dir /path/to/a/copy --max-rowid 1267241
  *
  *   node dist/bench/cli.js query --data-dir /path --from <ms> --to <ms>
+ *   node dist/bench/cli.js http-query --provider <plugin id> --from <iso> --to <iso>
  *
  * `run` measures one condition. `compare` puts several side by side, which is
  * the only form in which these numbers mean anything. `selftest` runs the
@@ -15,6 +16,12 @@
  * about a real workload. `roll` measures one roll, which `run` cannot: a roll
  * has no steady state and is gone before a window closes. `query` measures one
  * query the same way, and for the same reason.
+ *
+ * `query` and `http-query` ask different questions. `query` times this
+ * plugin's DuckDB engine against a tree on disk. `http-query` times a round
+ * trip over the Signal K v2 history route, addressed to one provider by plugin
+ * id — the only surface on which providers backed by different engines can be
+ * compared, and the one a dashboard actually calls.
  */
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -36,6 +43,7 @@ import {
 const SELFTEST_WRITE_INTERVAL_MS = 250;
 import { createProcSampler, parseSubjectSpec } from "./subjects.js";
 import { measureOneShot } from "./one-shot.js";
+import { measureHttpQuery } from "./http-query.js";
 import { QueryRunner } from "../query/duck.js";
 import type { QueryRequest } from "../query/duck.js";
 import { writerPaths } from "../writer/contract.js";
@@ -51,8 +59,9 @@ async function main(): Promise<void> {
   if (command === "selftest") return doSelftest(rest);
   if (command === "roll") return doRoll(rest);
   if (command === "query") return doQuery(rest);
+  if (command === "http-query") return doHttpQuery(rest);
   console.error(
-    "usage: cli.js run|compare|selftest|roll|query ... (see the file header)",
+    "usage: cli.js run|compare|selftest|roll|query|http-query ... (see the file header)",
   );
   process.exitCode = 2;
 }
@@ -290,6 +299,72 @@ async function doQuery(argv: string[]): Promise<void> {
 
 function mb(bytes: number | null): number | null {
   return bytes === null ? null : +(bytes / 1048576).toFixed(1);
+}
+
+/**
+ * One query, timed over the v2 history route against a named provider.
+ *
+ * Unlike `query`, this needs a running Signal K server rather than a data
+ * directory, and it works against any provider the server has registered — not
+ * only this one. It does not require Linux: nothing here reads /proc. It does
+ * want to run on the device, because a round trip measured from elsewhere
+ * measures the network.
+ */
+async function doHttpQuery(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      "base-url": { type: "string", default: "http://localhost:3000" },
+      provider: { type: "string" },
+      from: { type: "string" },
+      to: { type: "string" },
+      path: { type: "string", multiple: true, default: [] },
+      resolution: { type: "string" },
+      context: { type: "string" },
+      repeat: { type: "string", default: "4" },
+      "timeout-seconds": { type: "string" },
+      out: { type: "string", short: "o" },
+    },
+  });
+  if (!values.provider) {
+    throw new Error(
+      "--provider names the plugin id to address; it is required",
+    );
+  }
+  if (!values.from || !values.to) {
+    throw new Error("--from and --to are required, as ISO instants");
+  }
+  if (values.path.length === 0) {
+    throw new Error("--path is required, and may be repeated");
+  }
+
+  const result = await measureHttpQuery(
+    {
+      baseUrl: values["base-url"],
+      provider: values.provider,
+      from: values.from,
+      to: values.to,
+      paths: values.path,
+      ...(values.resolution
+        ? { resolution: numberOr(values.resolution, 0) }
+        : {}),
+      ...(values.context ? { context: values.context } : {}),
+    },
+    {
+      repeat: numberOr(values.repeat, 4),
+      ...(values["timeout-seconds"]
+        ? { timeoutMs: numberOr(values["timeout-seconds"], 60) * 1000 }
+        : {}),
+    },
+  );
+
+  const json = `${JSON.stringify(result, null, 2)}\n`;
+  if (values.out) {
+    writeFileSync(values.out, json);
+    console.error(`wrote ${values.out}`);
+  } else {
+    process.stdout.write(json);
+  }
 }
 
 /**
