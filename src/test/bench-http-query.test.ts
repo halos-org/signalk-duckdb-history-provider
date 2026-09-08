@@ -199,4 +199,43 @@ describe("timing a history query through the v2 route", () => {
       },
     );
   });
+
+  it("describes an unreadable body rather than quoting it", async () => {
+    // A truncated history answer is unparseable and carries recorded values.
+    // The size and the content type say what went wrong; the values do not.
+    stub.fail = {
+      status: 200,
+      body: '{"data":[["2026-09-08T06:00:00.000Z",3.403448275862068],["2026',
+    };
+
+    await assert.rejects(
+      () => measureHttpQuery(spec("provider-a"), { repeat: 1 }),
+      (error: Error) => {
+        // The recorded value, and the timestamp it was recorded at. The
+        // requested range is in the URL and stays there: the caller wrote it.
+        assert.doesNotMatch(error.message, /3\.403448275862068/);
+        assert.doesNotMatch(error.message, /06:00:00\.000Z/);
+        assert.match(error.message, /62 bytes/);
+        assert.match(error.message, /application\/json/);
+        return true;
+      },
+    );
+  });
+
+  it("refuses a repeat that is not a positive integer", async () => {
+    stub.fail = null;
+
+    // NaN slips past a `repeat < 1` guard, runs the loop zero times, and leaves
+    // the result claiming a cold run that never happened.
+    for (const repeat of [0, -1, 1.5, NaN, Number.POSITIVE_INFINITY]) {
+      await assert.rejects(
+        () => measureHttpQuery(spec("provider-a"), { repeat }),
+        (error: Error) => {
+          assert.match(error.message, /positive integer/);
+          return true;
+        },
+        `repeat ${repeat} should be refused`,
+      );
+    }
+  });
 });

@@ -117,8 +117,14 @@ async function runOnce(url: string, timeoutMs: number): Promise<HttpQueryRun> {
   try {
     parsed = JSON.parse(body);
   } catch {
+    // Described, not quoted. A history answer cut off in transit is also a body
+    // that will not parse, and its bytes are recorded vessel values. The size
+    // and the content type separate the two cases a reader has to tell apart —
+    // a proxy's HTML page from a truncated answer — without carrying any of it.
+    const contentType =
+      response.headers.get("content-type") ?? "no content type";
     throw new Error(
-      `${url} answered ${response.status} with a body that is not JSON: ${body.slice(0, 200)}`,
+      `${url} answered ${response.status} with ${body.length} bytes of ${contentType} that did not parse as JSON`,
     );
   }
   const data = (parsed as { data?: unknown }).data;
@@ -134,7 +140,11 @@ export async function measureHttpQuery(
   options: HttpQueryOptions = {},
 ): Promise<HttpQueryResult> {
   const repeat = options.repeat ?? DEFAULT_REPEAT;
-  if (repeat < 1) throw new Error(`repeat ${repeat} measures nothing`);
+  // Not `repeat < 1`: NaN fails that comparison, runs the loop zero times, and
+  // leaves the result carrying an undefined cold run as if it were measured.
+  if (!Number.isInteger(repeat) || repeat < 1) {
+    throw new Error(`repeat must be a positive integer, not ${repeat}`);
+  }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   const available = await registeredProviders(spec.baseUrl, timeoutMs);
