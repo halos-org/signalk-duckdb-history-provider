@@ -112,7 +112,11 @@ export interface ReadResult {
 interface TreeFile {
   day: number;
   path: string;
-  /** The file's own name, which is the id of the roll that wrote it. */
+  /**
+   * The file's own name: `<rollId>.parquet` for a roll, `hour-<ms>.parquet`
+   * for a merged hour. Nothing parses it; `rolledOverlap` compares whole
+   * names and the query reads `path`.
+   */
   name: string;
 }
 
