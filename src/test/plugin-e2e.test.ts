@@ -183,16 +183,17 @@ describe("a delta reaching the writer's store", () => {
           compactHourly,
         });
 
-        await eventually(
-          () => calls.debug.some((line) => line.includes("writer ready")),
-          `the writer to report itself (errors: ${JSON.stringify(calls.errors)})`,
+        // The writer prints its ready line and the effective configuration
+        // in one write, but the plugin relays each stdout chunk as its own
+        // debug call, so wait for the whole pattern rather than for the
+        // ready line alone.
+        const effective = new RegExp(
+          `rolling every ${interval} minutes, keeping 14 days, ` +
+            expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
         );
-        assert.match(
-          calls.debug.join("\n"),
-          new RegExp(
-            `rolling every ${interval} minutes, keeping 14 days, ` +
-              expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-          ),
+        await eventually(
+          () => effective.test(calls.debug.join("\n")),
+          `the writer to report "${expected}" (errors: ${JSON.stringify(calls.errors)})`,
         );
       } finally {
         await plugin.stop();
