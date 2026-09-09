@@ -18,6 +18,7 @@ import { expire } from "../retention/expire.js";
 import type { ExpiryFailure } from "../retention/expire.js";
 import { writerPaths } from "../writer/contract.js";
 import {
+  compactedHourCovering,
   dateDirectory,
   rollFile,
   rollTempFile,
@@ -183,8 +184,10 @@ export async function roll(options: RollOptions): Promise<RollResult> {
       `ATTACH '${sqlLiteral(writerPaths(dataDir).store)}' AS hot (TYPE SQLITE, READ_ONLY)`,
     );
 
+    const days = await coveredDays(connection, maxRowid);
+    refuseMergedHour(dataDir, days, rollId);
     const files: RolledFile[] = [];
-    for (const day of await coveredDays(connection, maxRowid)) {
+    for (const day of days) {
       files.push(
         await writeDay({
           connection,
@@ -411,6 +414,50 @@ function writeStderr(line: string): void {
  * likely to be killed are the ones with the least free disk. Age is what
  * makes this safe against a roll running right now.
  */
+/**
+ * Refuse a roll id an existing merge already covers, before anything is
+ * written.
+ *
+ * A merge unlinks the rolls it folded in, so a free name proves nothing about
+ * whether the hour it belongs to has been merged. And `liveTreeFiles`
+ * suppresses a roll by the id range a compacted file covers, not by the set
+ * that merge actually read -- so such a roll would be on disk, reported as
+ * written, and returned by no query, while the writer truncated its rows out
+ * of the hot store on the strength of that report. Refusing is what makes the
+ * reader's range rule safe to keep.
+ *
+ * `NameTakenError` because the outcome the scheduler must reach is the same
+ * one: do not retry under this id, and leave the rows in the hot store. They
+ * are recorded again by the next roll, under a name past the merged hour.
+ *
+ * Decided for every date this roll touches before the first is written, and
+ * not subject to `--replace`. A roll spanning midnight writes one file per
+ * date, and refusing part way through would leave rows in the tree that the
+ * failure tells the scheduler are not there.
+ */
+function refuseMergedHour(
+  dataDir: string,
+  days: number[],
+  rollId: number,
+): void {
+  for (const day of days) {
+    const directory = dateDirectory(dataDir, day * DAY_MS);
+    let names: string[];
+    try {
+      names = readdirSync(directory);
+    } catch {
+      continue; // Not created yet, which is the ordinary case.
+    }
+    const covering = compactedHourCovering(names, rollId);
+    if (covering === null) continue;
+    throw new NameTakenError(
+      `roll ${rollId} falls inside ${join(directory, covering)}, an hour a ` +
+        `merge has already written. A roll there is on disk and invisible to ` +
+        `every query, so these rows stay in the hot store instead.`,
+    );
+  }
+}
+
 function sweepStaleTemporaries(directory: string, own: string): void {
   const cutoff = Date.now() - STALE_SCRATCH_MS;
   for (const entry of readdirSync(directory)) {

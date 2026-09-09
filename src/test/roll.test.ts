@@ -96,6 +96,7 @@ function readParquet(pattern: string): Record<string, unknown>[] {
 
 const DAY = 86_400_000;
 const AUG_23 = Date.UTC(2026, 7, 23);
+const AUG_24 = Date.UTC(2026, 7, 24);
 
 describe("a roll", { skip: NO_BUNDLED_EXTENSION }, () => {
   it("writes every covered row and no more", async () => {
@@ -206,6 +207,79 @@ describe("a roll", { skip: NO_BUNDLED_EXTENSION }, () => {
     assert.deepEqual(
       readParquet(join(dateDirectory(dir, AUG_23), "42.parquet")),
       before,
+    );
+  });
+
+  /**
+   * A merge unlinks the rolls it folded in, so a free name proves nothing
+   * about whether the hour has been merged. `liveTreeFiles` suppresses by the
+   * id range a compacted file covers, not by the set that merge read — so a
+   * roll written into a merged hour would be on disk, reported as written, and
+   * returned by no query, while the writer truncated its rows on the strength
+   * of that report.
+   */
+  it("refuses a roll id an existing merge already covers", async () => {
+    const hour = Math.floor((AUG_23 + 5000) / 3_600_000) * 3_600_000;
+    mkdirSync(dateDirectory(dir, AUG_23), { recursive: true });
+    writeFileSync(join(dateDirectory(dir, AUG_23), `hour-${hour}.parquet`), "");
+
+    record(sample({ ts: AUG_23 + 5000, path: "a.b" }));
+    await assert.rejects(
+      () => roll({ dataDir: dir, maxRowid: 1, rollId: hour + 300_000 }),
+      /a merge has already/,
+    );
+    assert.equal(
+      existsSync(join(dateDirectory(dir, AUG_23), `${hour + 300_000}.parquet`)),
+      false,
+    );
+    assert.equal(store.rowCount(), 1);
+  });
+
+  /**
+   * A retry inherits the failed attempt's id, and an hour merged in between
+   * makes that id just as invisible as a fresh one. `--replace` grants
+   * permission to overwrite this roll's own output, never to write into a
+   * range a reader has stopped looking at.
+   */
+  it("refuses a covered id even for a retry", async () => {
+    const hour = Math.floor((AUG_23 + 5000) / 3_600_000) * 3_600_000;
+    mkdirSync(dateDirectory(dir, AUG_23), { recursive: true });
+    writeFileSync(join(dateDirectory(dir, AUG_23), `hour-${hour}.parquet`), "");
+    record(sample({ ts: AUG_23 + 5000, path: "a.b" }));
+    await assert.rejects(
+      () =>
+        roll({
+          dataDir: dir,
+          maxRowid: 1,
+          rollId: hour + 300_000,
+          replace: true,
+        }),
+      /a merge has already/,
+    );
+  });
+
+  /**
+   * A roll spanning midnight writes one file per date. Refusing part way
+   * through would leave rows in the tree that the failure tells the scheduler
+   * are not there, and the next roll would write them a second time.
+   */
+  it("writes nothing at all when one of its dates is inside a merged hour", async () => {
+    const rollId = AUG_24 + 300_000;
+    const hour = AUG_24;
+    mkdirSync(dateDirectory(dir, AUG_24), { recursive: true });
+    writeFileSync(join(dateDirectory(dir, AUG_24), `hour-${hour}.parquet`), "");
+
+    record(
+      sample({ ts: AUG_24 - 1000, path: "a.b" }),
+      sample({ ts: AUG_24 + 1000, path: "a.b" }),
+    );
+    await assert.rejects(
+      () => roll({ dataDir: dir, maxRowid: 2, rollId }),
+      /a merge has already/,
+    );
+    assert.equal(
+      existsSync(join(dateDirectory(dir, AUG_23), `${rollId}.parquet`)),
+      false,
     );
   });
 
