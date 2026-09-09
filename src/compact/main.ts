@@ -26,7 +26,10 @@ import { compactHour } from "./compact.js";
  * There is no lock here, unlike the roll. Within a writer the scheduler runs
  * one child at a time, and across writers the sets do not collide: a roll
  * writes a file named for a slot this hour has already closed over, while the
- * merge only ever reads ids at or below that boundary.
+ * merge only ever reads ids at or below that boundary. What a second merge of
+ * the same hour cannot do is overwrite the first -- `planCompaction` reports
+ * an hour whose output exists as already merged, and the only thing done to it
+ * is the removal of inputs the first run did not get to.
  */
 
 function writeStderr(line: string): void {
@@ -41,10 +44,10 @@ function argValue(name: string): string | undefined {
 async function main(): Promise<void> {
   const dataDir = argValue("--data-dir");
   if (dataDir === undefined) throw new Error("--data-dir is required");
+  // Only that it is a number. `compactHour` owns what a mergeable hour is --
+  // aligned, closed, and with no roll of it still in flight -- because the
+  // scheduler reaches it without passing through here.
   const hour = Number(argValue("--hour"));
-  if (!Number.isInteger(hour) || hour < 1) {
-    throw new Error(`--hour ${argValue("--hour")} is not an hour start`);
-  }
 
   const result = await compactHour({
     dataDir,

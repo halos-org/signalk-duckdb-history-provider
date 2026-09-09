@@ -1,16 +1,19 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compactHour } from "../compact/compact.js";
-import { HOUR_MS } from "../compact/plan.js";
+import { HOUR_MS, planCompaction } from "../compact/plan.js";
 import { DATA_LAYOUT } from "../data-dir.js";
 import { QueryRunner } from "../query/duck.js";
 import type { QueryRequest } from "../query/duck.js";
@@ -75,6 +78,39 @@ async function rollSlice(
 
 async function read(request: QueryRequest): Promise<unknown[][]> {
   return (await runner.run(request)).rows;
+}
+
+/**
+ * The `path` column of a Parquet file in the order the file stores it.
+ *
+ * No ORDER BY: file order is the thing under test. A query would impose its
+ * own and hide whether the merge sorted anything.
+ */
+function storedPaths(file: string): string[] {
+  const probe = [
+    `const { DuckDBInstance } = await import(${JSON.stringify("@duckdb/node-api")});`,
+    `const instance = await DuckDBInstance.create(":memory:");`,
+    `const c = await instance.connect();`,
+    `const r = await c.runAndReadAll(${JSON.stringify(
+      `SELECT path FROM read_parquet('${file}')`,
+    )});`,
+    `console.log(JSON.stringify(r.getRowsJS().map((row) => row[0])));`,
+  ].join("\n");
+  const output = execFileSync(
+    process.execPath,
+    ["--input-type=module", "-e", probe],
+    { encoding: "utf8", timeout: 60_000, cwd: process.cwd() },
+  );
+  return JSON.parse(output.trim()) as string[];
+}
+
+/** How many times the `path` column changes value down the file. */
+function runsOfEqualPath(paths: string[]): number {
+  let runs = 0;
+  for (let i = 0; i < paths.length; i += 1) {
+    if (i === 0 || paths[i] !== paths[i - 1]) runs += 1;
+  }
+  return runs;
 }
 
 /** Twelve five-minute rolls covering the hour, as the scheduler would write them. */
@@ -159,5 +195,159 @@ describe("compactHour", () => {
     assert.deepEqual(readdirSync(dateDirectory(dir, HOUR)), [
       `hour-${HOUR}.parquet`,
     ]);
+  });
+
+  /**
+   * **The sort is the whole feature.** Clustering identical `path` strings is
+   * what lets the dictionary and RLE work and what gives the row-group
+   * statistics something to prune on; without it the merge buys a file count
+   * and nothing else.
+   *
+   * Counted as runs rather than compared against a sorted copy, and never
+   * asserted on the file's size: at this fixture's scale the unsorted output
+   * is the smaller of the two, because per-file overhead dominates 240 rows.
+   */
+  it("stores the merged hour clustered by path", async () => {
+    await fillHour();
+    const inputs = planCompaction(dir, HOUR)[0].inputs;
+    const beforeRuns = runsOfEqualPath(
+      inputs.flatMap((input) => storedPaths(input)),
+    );
+    await compactHour({ dataDir: dir, hourStartMs: HOUR });
+
+    const after = storedPaths(compactedFile(dir, HOUR, HOUR));
+    assert.equal(after.length, 240);
+    // Two paths in the fixture, alternating row by row in the rolls.
+    assert.equal(beforeRuns, 240);
+    assert.equal(runsOfEqualPath(after), 2);
+  });
+
+  /**
+   * **The interrupted unlink.** A merge renames its output into place and
+   * removes its inputs afterwards, deliberately not atomically. Killed in
+   * between, the hour is correct and some of its inputs are still on disk.
+   * Merging those survivors would write a fraction of the hour and rename it
+   * over the whole of it — and the rows in the inputs already removed are by
+   * then the only copy, because the hot store truncated them hours earlier.
+   */
+  it("removes the leftovers of an interrupted merge instead of merging them", async () => {
+    await fillHour();
+    const request: QueryRequest = {
+      kind: "range",
+      from: HOUR,
+      to: HOUR + HOUR_MS,
+      context: "self",
+    };
+    const before = await read(request);
+    assert.equal(before.length, 240);
+
+    const inputs = planCompaction(dir, HOUR)[0].inputs;
+    const kept = inputs.slice(0, 5);
+    const keptCopies = kept.map((input) => `${input}.saved`);
+    for (const [i, input] of kept.entries()) copyFileSync(input, keptCopies[i]);
+    await compactHour({ dataDir: dir, hourStartMs: HOUR });
+    // The state a merge killed between the rename and the last unlink leaves.
+    for (const [i, input] of kept.entries()) copyFileSync(keptCopies[i], input);
+    for (const copy of keptCopies) rmSync(copy);
+
+    const again = await compactHour({ dataDir: dir, hourStartMs: HOUR });
+    assert.deepEqual(again.files, []);
+    assert.deepEqual(again.alreadyCompacted, [compactedFile(dir, HOUR, HOUR)]);
+    assert.deepEqual(readdirSync(dateDirectory(dir, HOUR)), [
+      `hour-${HOUR}.parquet`,
+    ]);
+    assert.deepEqual(await read(request), before);
+  });
+
+  it("refuses an hour that does not start on the hour", async () => {
+    await assert.rejects(
+      () => compactHour({ dataDir: dir, hourStartMs: HOUR + 300_000 }),
+      /not aligned/,
+    );
+  });
+
+  /**
+   * The hour is closed by the roll at its upper boundary, which runs at that
+   * instant and lands seconds later. Merging before then hides every roll of
+   * the hour still to come.
+   */
+  it("refuses an hour whose closing roll has not run", async () => {
+    await assert.rejects(
+      () =>
+        compactHour({
+          dataDir: dir,
+          hourStartMs: HOUR,
+          now: () => HOUR + HOUR_MS,
+        }),
+      /not closed yet/,
+    );
+    await assert.rejects(
+      () =>
+        compactHour({
+          dataDir: dir,
+          hourStartMs: HOUR,
+          now: () => HOUR + HOUR_MS - 1,
+        }),
+      /not closed yet/,
+    );
+  });
+
+  /**
+   * A roll in flight is a roll whose file is not on disk yet. Merging past it
+   * leaves it to arrive into a merged hour, which the roll then has to refuse
+   * — costing recording rather than rows, but costing it for nothing.
+   */
+  it("refuses while a roll of that hour is unfinished", async () => {
+    await fillHour();
+    writeFileSync(
+      writerPaths(dir).pendingRoll,
+      `${JSON.stringify({
+        rollId: HOUR + 600_000,
+        maxRowid: 1,
+        phase: "rolling",
+      })}\n`,
+    );
+    await assert.rejects(
+      () => compactHour({ dataDir: dir, hourStartMs: HOUR }),
+      /is unfinished/,
+    );
+    assert.equal(readdirSync(dateDirectory(dir, HOUR)).length, 12);
+  });
+
+  it("merges past a pending roll that belongs to another hour", async () => {
+    await fillHour();
+    writeFileSync(
+      writerPaths(dir).pendingRoll,
+      `${JSON.stringify({
+        rollId: HOUR + HOUR_MS + 300_000,
+        maxRowid: 1,
+        phase: "rolling",
+      })}\n`,
+    );
+    const result = await compactHour({ dataDir: dir, hourStartMs: HOUR });
+    assert.equal(result.files.length, 1);
+  });
+
+  /**
+   * A `.tmp` in a date directory is collected by the next roll that writes
+   * there — except for the unit of a midnight-spanning hour, which lands in
+   * the day before, a directory no later roll touches.
+   */
+  it("leaves no temporary behind when the merge fails", async () => {
+    await fillHour();
+    const directory = dateDirectory(dir, HOUR);
+    const corrupt = readdirSync(directory)[0];
+    writeFileSync(join(directory, corrupt), "not a parquet file");
+
+    await assert.rejects(() =>
+      compactHour({ dataDir: dir, hourStartMs: HOUR }),
+    );
+    assert.deepEqual(
+      readdirSync(directory).filter((name) => name.endsWith(".tmp")),
+      [],
+    );
+    // And the inputs are all still there: nothing is unlinked before a merge
+    // has landed.
+    assert.equal(readdirSync(directory).length, 12);
   });
 });
