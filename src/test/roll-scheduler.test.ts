@@ -962,6 +962,26 @@ describe("compaction, scheduled", () => {
     assert.equal(store.rowCount(), 0);
   });
 
+  /**
+   * The merge logs each unit it finishes to stderr before it reaches the one
+   * that fails, so the first stderr line is progress and the last is the
+   * error. The roll's rule -- first line is the message, the rest is a stack
+   * -- reports the wrong line here.
+   */
+  it("reports the merge's error, not its progress, when it fails", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({
+      ...FIVE,
+      spawnCompact: () =>
+        child(
+          `console.error("compacted 12 files into hour-1.parquet: 240 rows"); ` +
+            `console.error("ENOSPC: no space left on device"); process.exit(1)`,
+        ),
+    }).rollOnce(SLOT);
+
+    assert.match(errors.join("\n"), /code 1: ENOSPC: no space left on device/);
+  });
+
   it("names the signal when a merge is killed", async () => {
     record(sample({ ts: AUG_23 }));
     await scheduler({

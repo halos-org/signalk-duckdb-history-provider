@@ -532,7 +532,15 @@ export class RollScheduler {
       child.on("close", (code, signal) => {
         if (code !== 0) {
           const how = code === null ? `signal ${signal}` : `code ${code}`;
-          const reason = err.trim().split("\n")[0] ?? "";
+          // The last non-empty line, not the first: the merge logs each unit
+          // it finished to stderr, and `compact/main.js` writes the error
+          // after them.
+          const reason =
+            err
+              .split("\n")
+              .map((line) => line.trim())
+              .filter((line) => line !== "")
+              .at(-1) ?? "";
           settle({
             ok: false,
             why: reason === "" ? `it exited ${how}` : `${how}: ${reason}`,
