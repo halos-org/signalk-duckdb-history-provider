@@ -96,9 +96,10 @@ a check on module evaluation alone.
   the roll all share. **The rule is not a file list and not "one directory owns
   the engine": `@duckdb/node-api` may never be reachable from `src/index.ts` or
   from `src/writer/`, both of which run for as long as recording does.**
-  Everything that does import it — `roll/roll.ts`, `query/reader.ts`,
-  `compact/compact.ts` and `duckdb/check-extension.ts` — runs in a process that
-  exits. `src/test/plugin-import-graph.test.ts` checks the invariant against
+  Everything that does import it runs in its own process: `roll/roll.ts`,
+  `compact/compact.ts` and `duckdb/check-extension.ts` in one that exits,
+  `query/reader.ts` in the long-lived query service.
+  `src/test/plugin-import-graph.test.ts` checks the invariant against
   the compiled plugin and writer; nothing checks a count, which is why the
   count is not stated here.
 - `src/compact/` — the hourly merge. `main.ts` is the process the writer
