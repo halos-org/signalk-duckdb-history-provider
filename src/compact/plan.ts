@@ -1,8 +1,9 @@
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   compactedFile,
   compactedTempFile,
+  coversHour,
   dateDirectoryStart,
   rollIdFromName,
   treeRoot,
@@ -11,54 +12,57 @@ import {
 /**
  * Which files a completed hour's merge reads, and what it writes.
  *
- * Pure apart from two directory listings, so the rule that decides the set can
- * be tested without an engine. Nothing here opens a Parquet file: the set is
+ * Pure apart from directory listings, so the rule that decides the set can be
+ * tested without an engine. Nothing here opens a Parquet file: the set is
  * chosen by roll id, because a roll places each row in the date directory that
  * row's own timestamp names and a set chosen by content could only be found by
  * reading every file first.
- */
-
-/** Milliseconds in the hour a merge covers. */
-export const HOUR_MS = 3_600_000;
-
-/**
- * The rolls a merge folds in are those that *ran* inside `(hour, hour + 1h]`,
- * not those named inside `[hour, hour + 1h)`.
  *
- * A roll writes the interval that just ended, so the roll at 12:00 carries
- * 11:55–12:00. Taking the half-open range from the top of the hour would put
- * an hour of data under a name an hour ahead of it, and the file called
- * `hour-11:00` would hold 10:55 to 11:55. The closed upper end is what makes
- * the name describe the contents.
+ * `HOUR_MS` and `coversHour` are re-exported from `roll/tree-path.ts` rather
+ * than declared here. The reader's suppression rule, the roll's refusal and
+ * this planner have to be the same predicate, and one of them living in a
+ * module the other two do not import is how they would drift apart.
  */
-export function coversHour(rollId: number, hourStartMs: number): boolean {
-  return rollId > hourStartMs && rollId <= hourStartMs + HOUR_MS;
-}
+
+export { HOUR_MS, coversHour } from "../roll/tree-path.js";
 
 /** One date directory's share of an hour. A roll spanning midnight has two. */
 export interface CompactionUnit {
-  /** UTC midnight of the date directory, as `dateDirectoryStart` names it. */
-  day: number;
   directory: string;
   /** Absolute paths of the roll files to merge, in name order. */
   inputs: string[];
   /** Where the merge renames to, and what it writes through first. */
   output: string;
   temp: string;
+  /**
+   * The output is already on disk, so `inputs` are leftovers to remove rather
+   * than rows to merge.
+   *
+   * A merge renames its output into place and unlinks its inputs afterwards,
+   * and the two are deliberately not atomic. Interrupted in between — SIGKILL,
+   * a plugin stop, a power cut, a card gone read-only — the hour is left
+   * correct with some of its inputs still on disk. Planning a merge from those
+   * survivors would produce a file holding a fraction of the hour and rename
+   * it over the complete one, and the rows in the already-unlinked inputs are
+   * by then the only copy: the hot store truncated them when the rolls landed.
+   */
+  alreadyMerged: boolean;
 }
 
 /**
  * The units a merge of `hourStartMs` would do, or an empty list when there is
- * nothing worth merging.
+ * nothing to merge and nothing left over to remove.
  *
  * A directory holding one roll file for the hour is skipped: rewriting it
  * under a second name would cost a read and a write to produce the same rows,
  * and the sort buys nothing across a single roll's worth of paths that a later
- * hour will not buy again.
+ * hour will not buy again. That threshold does not apply once the output
+ * exists — one leftover input is still one file to remove.
  */
 export function planCompaction(
   dataDir: string,
   hourStartMs: number,
+  pid: number = process.pid,
 ): CompactionUnit[] {
   const root = treeRoot(dataDir);
   let entries: string[];
@@ -86,13 +90,15 @@ export function planCompaction(
       })
       .sort()
       .map((name) => join(directory, name));
-    if (inputs.length < 2) continue;
+    const output = compactedFile(dataDir, day, hourStartMs);
+    const alreadyMerged = existsSync(output);
+    if (inputs.length < (alreadyMerged ? 1 : 2)) continue;
     units.push({
-      day,
       directory,
       inputs,
-      output: compactedFile(dataDir, day, hourStartMs),
-      temp: compactedTempFile(dataDir, day, hourStartMs),
+      output,
+      temp: compactedTempFile(dataDir, day, hourStartMs, pid),
+      alreadyMerged,
     });
   }
   return units;

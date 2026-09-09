@@ -156,8 +156,8 @@ export function assertUnderDataDir(dataDir: string, path: string): string {
  * by looking for `<rollId>.parquet` in a date directory, so a merged file
  * named with a bare number could be mistaken for the output of the roll whose
  * id it matched — and the seam would then subtract rows the merge had already
- * folded in. The two name spaces have to stay apart. `treeFilesInRange` globs
- * `*.parquet` and reads both kinds without caring which is which.
+ * folded in. The two name spaces have to stay apart, and `liveTreeFiles` is
+ * what tells them apart for a reader.
  *
  * Named for the hour it covers rather than for the instant the merge ran, so
  * a retry after a failure writes the same name and replaces its own output
@@ -177,13 +177,24 @@ export function compactedFile(
   );
 }
 
-/** Where a merge writes before it renames, for the reason `rollTempFile` gives. */
+/**
+ * Where a merge writes before it renames, for the reason `rollTempFile` gives.
+ *
+ * The pid is in the name because a merge takes no claim on the hour — no lock,
+ * no pending record, nothing the roll's `NameTakenError` can catch. Two merges
+ * of one hour sharing a temp path would interleave one COPY's bytes with the
+ * other's and rename the mixture into place.
+ */
 export function compactedTempFile(
   dataDir: string,
   ts: number,
   hourStartMs: number,
+  pid: number,
 ): string {
-  return `${compactedFile(dataDir, ts, hourStartMs)}.tmp`;
+  if (!Number.isInteger(pid) || pid < 1) {
+    throw new RangeError(`${pid} is not a process id`);
+  }
+  return `${compactedFile(dataDir, ts, hourStartMs)}.${pid}.tmp`;
 }
 
 const COMPACTED_PREFIX = "hour-";
@@ -216,6 +227,48 @@ export function compactedHourFromName(name: string): number | null {
   return Number.isSafeInteger(hour) && hour >= 1 ? hour : null;
 }
 
+/** Milliseconds in the hour one merged file covers. */
+export const HOUR_MS = 3_600_000;
+
+/**
+ * Whether a roll belongs to the hour a merge covers.
+ *
+ * The rolls a merge folds in are those that *ran* inside `(hour, hour + 1h]`,
+ * not those named inside `[hour, hour + 1h)`.
+ *
+ * A roll writes the interval that just ended, so the roll at 12:00 carries
+ * 11:55–12:00. Taking the half-open range from the top of the hour would put
+ * an hour of data under a name an hour ahead of it, and the file called
+ * `hour-11:00` would hold 10:55 to 11:55. The closed upper end is what makes
+ * the name describe the contents.
+ *
+ * It lives here, beside the names it reads, because three separate rules
+ * depend on being the same predicate: which rolls a merge takes, which rolls a
+ * reader stops returning once that merge lands, and which roll ids the roll
+ * itself must now refuse. Two copies of it would be two answers to the same
+ * question, and the disagreement would be silent in both directions.
+ */
+export function coversHour(rollId: number, hourStartMs: number): boolean {
+  return rollId > hourStartMs && rollId <= hourStartMs + HOUR_MS;
+}
+
+/**
+ * The compacted file in this directory that already holds `rollId`'s hour, or
+ * null when no merge covers it.
+ *
+ * `names` is one date directory's listing.
+ */
+export function compactedHourCovering(
+  names: string[],
+  rollId: number,
+): string | null {
+  for (const name of names) {
+    const hour = compactedHourFromName(name);
+    if (hour !== null && coversHour(rollId, hour)) return name;
+  }
+  return null;
+}
+
 /**
  * The files in one date directory a reader should read.
  *
@@ -231,19 +284,16 @@ export function compactedHourFromName(name: string): number | null {
  * moment, and a merge killed before it gets to them leaves files that are
  * ignored rather than files that are wrong.
  *
- * `HOUR_MS` is spelled here rather than imported so the tree's naming rules
- * stay free of the compaction module; `compact/plan.ts` re-exports the same
- * constant and `coversHour` is its inverse.
+ * The suppression is by id range, not by the set the merge actually read, so a
+ * roll that lands in an already-merged hour would be dropped here too. That is
+ * why `writeDay` refuses such an id outright: this function is allowed to
+ * assume no roll ever arrives inside a merged hour, and the roll is what makes
+ * the assumption true.
  */
 export function liveTreeFiles(names: string[]): string[] {
-  const hours: number[] = [];
-  for (const name of names) {
-    const hour = compactedHourFromName(name);
-    if (hour !== null) hours.push(hour);
-  }
   return names.filter((name) => {
     const id = rollIdFromName(name);
     if (id === null) return true;
-    return !hours.some((hour) => id > hour && id <= hour + 3_600_000);
+    return compactedHourCovering(names, id) === null;
   });
 }

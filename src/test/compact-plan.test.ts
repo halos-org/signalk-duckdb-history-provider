@@ -60,7 +60,8 @@ describe("planCompaction", () => {
     assert.equal(rest.length, 0);
     assert.equal(unit.inputs.length, 3);
     assert.equal(basename(unit.output), `hour-${HOUR}.parquet`);
-    assert.equal(unit.temp, `${unit.output}.tmp`);
+    assert.equal(unit.temp, `${unit.output}.${process.pid}.tmp`);
+    assert.equal(unit.alreadyMerged, false);
   });
 
   it("leaves rolls from other hours alone", () => {
@@ -122,6 +123,56 @@ describe("planCompaction", () => {
     assert.equal(
       unit.inputs.some((p) => basename(p).startsWith("hour-")),
       false,
+    );
+  });
+
+  /**
+   * **The interrupted unlink.** An hour whose output is already on disk with
+   * rolls still beside it is what a merge killed between its rename and its
+   * last unlink leaves. Planning a merge from those survivors would write a
+   * fraction of the hour and rename it over the whole of it.
+   */
+  it("marks an hour whose output already exists as merged", () => {
+    tree(
+      "2026-09-02",
+      `hour-${HOUR}.parquet`,
+      `${HOUR + 300_000}.parquet`,
+      `${HOUR + 600_000}.parquet`,
+    );
+    const [unit] = planCompaction(dir, HOUR);
+    assert.equal(unit.alreadyMerged, true);
+  });
+
+  /**
+   * The two-input threshold is about whether a merge is worth doing. Once the
+   * output exists there is no merge to be worth anything — one leftover is
+   * still one file to remove.
+   */
+  it("plans a single leftover input once the output exists", () => {
+    tree("2026-09-02", `hour-${HOUR}.parquet`, `${HOUR + 300_000}.parquet`);
+    const [unit, ...rest] = planCompaction(dir, HOUR);
+    assert.equal(rest.length, 0);
+    assert.equal(unit.alreadyMerged, true);
+    assert.deepEqual(
+      unit.inputs.map((p) => basename(p)),
+      [`${HOUR + 300_000}.parquet`],
+    );
+  });
+
+  it("is empty for a merged hour with nothing left beside it", () => {
+    tree("2026-09-02", `hour-${HOUR}.parquet`);
+    assert.deepEqual(planCompaction(dir, HOUR), []);
+  });
+
+  it("gives two merges of one hour different temp files", () => {
+    tree(
+      "2026-09-02",
+      `${HOUR + 300_000}.parquet`,
+      `${HOUR + 600_000}.parquet`,
+    );
+    assert.notEqual(
+      planCompaction(dir, HOUR, 11)[0].temp,
+      planCompaction(dir, HOUR, 12)[0].temp,
     );
   });
 

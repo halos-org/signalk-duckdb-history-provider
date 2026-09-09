@@ -122,7 +122,7 @@ describe("containment", () => {
  * `rolledOverlap` resolves the seam by looking for `<rollId>.parquet` in a
  * date directory, so a merged file that could collide with a roll id would be
  * mistaken for that roll's own output. The prefix is what keeps the two name
- * spaces apart; `treeFilesInRange` globs `*.parquet` and reads both.
+ * spaces apart, and `liveTreeFiles` is what tells them apart for a reader.
  */
 describe("compacted file names", () => {
   it("names an hour's merge distinctly from any roll", () => {
@@ -135,8 +135,21 @@ describe("compacted file names", () => {
   it("writes through a .tmp the reader's glob does not match", () => {
     const hour = Date.UTC(2026, 8, 2, 13);
     assert.equal(
-      compactedTempFile("/data", hour, hour),
-      `${compactedFile("/data", hour, hour)}.tmp`,
+      compactedTempFile("/data", hour, hour, 4242),
+      `${compactedFile("/data", hour, hour)}.4242.tmp`,
+    );
+  });
+
+  /**
+   * A merge takes no claim on the hour -- no lock, no pending record, nothing
+   * the roll's `NameTakenError` can catch. Two merges of one hour sharing a
+   * temp path would interleave one COPY's bytes with the other's.
+   */
+  it("gives two merges of one hour different temp files", () => {
+    const hour = Date.UTC(2026, 8, 2, 13);
+    assert.notEqual(
+      compactedTempFile("/data", hour, hour, 11),
+      compactedTempFile("/data", hour, hour, 12),
     );
   });
 
