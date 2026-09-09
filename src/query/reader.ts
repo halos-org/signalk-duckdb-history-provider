@@ -23,9 +23,11 @@ import type { QueryRequest, ValueAggregate } from "./duck.js";
 /**
  * The hot store and the Parquet tree, read as one.
  *
- * This runs in the query service — it is the only file besides `roll/roll.ts`
- * that may import the engine, and it may because that process is not the
- * Signal K server. Everything is one statement: the tree files that intersect
+ * This runs in the query service — one of the few files that may import the
+ * engine, and it may because that process is not the Signal K server. The rule
+ * is not a file list: the engine may never be reachable from `src/index.ts` or
+ * from `src/writer/`, and everything that imports it runs in a process that
+ * exits. Everything is one statement: the tree files that intersect
  * the range, the unrolled remainder of the hot store, and one filter over
  * both.
  *

@@ -407,14 +407,6 @@ function writeStderr(line: string): void {
 }
 
 /**
- * Remove `.tmp` files a killed roll left in a date directory.
- *
- * A `*.parquet` glob skips them, so they are disk cost rather than a
- * correctness problem — but nothing else collects them, and the rolls most
- * likely to be killed are the ones with the least free disk. Age is what
- * makes this safe against a roll running right now.
- */
-/**
  * Refuse a roll id an existing merge already covers, before anything is
  * written.
  *
@@ -458,6 +450,14 @@ function refuseMergedHour(
   }
 }
 
+/**
+ * Remove `.tmp` files a killed roll left in a date directory.
+ *
+ * A `*.parquet` glob skips them, so they are disk cost rather than a
+ * correctness problem — but nothing else collects them, and the rolls most
+ * likely to be killed are the ones with the least free disk. Age is what
+ * makes this safe against a roll running right now.
+ */
 function sweepStaleTemporaries(directory: string, own: string): void {
   const cutoff = Date.now() - STALE_SCRATCH_MS;
   for (const entry of readdirSync(directory)) {

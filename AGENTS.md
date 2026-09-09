@@ -87,23 +87,29 @@ a check on module evaluation alone.
   at
   [signalk-questdb-history-provider#23](https://github.com/halos-org/signalk-questdb-history-provider/issues/23).
 - `src/duckdb/` — version and platform naming, the bundled-extension resolver,
-  and the standalone offline check. Nothing here imports the engine either;
-  the resolver only finds and expands its binary.
+  and the standalone offline check. The resolver only finds and expands the
+  engine's binary and does not import it; `check-extension.ts` does import it,
+  and may, because it is a CLI that exits.
 - `src/roll/` — the roll. `main.ts` is the process the writer spawns, `roll.ts`
   the work it does, `schedule.ts` the every-N-minutes-from-UTC-midnight grid,
   `tree-path.ts` the tree's paths and the hour rule the merge, the reader and
-  the roll all share. **`roll.ts`, `query/reader.ts` and `compact/compact.ts`
-  are the only three files in the package that import `@duckdb/node-api`**, and
-  they may because everything importing any of them runs in a process that
-  exits. The rule is not "one directory owns the engine"; it is that the engine
-  may never be reachable from `src/index.ts` or from `src/writer/`, both of
-  which run for as long as recording does.
+  the roll all share. **The rule is not a file list and not "one directory owns
+  the engine": `@duckdb/node-api` may never be reachable from `src/index.ts` or
+  from `src/writer/`, both of which run for as long as recording does.**
+  Everything that does import it — `roll/roll.ts`, `query/reader.ts`,
+  `compact/compact.ts` and `duckdb/check-extension.ts` — runs in a process that
+  exits. `src/test/plugin-import-graph.test.ts` checks the invariant against
+  the compiled plugin and writer; nothing checks a count, which is why the
+  count is not stated here.
 - `src/compact/` — the hourly merge. `main.ts` is the process the writer
-  spawns after a roll closes an hour, `compact.ts` the work it does,
-  `plan.ts` the pure rule choosing which files it reads and what it writes.
-  Its preconditions live in `compactHour`, not in its callers: the scheduler
-  and a hand-run backfill reach the same function and only one of them knows
-  the schedule.
+  spawns at a slot that closes an hour, whether or not that slot had rows to
+  roll; `compact.ts` the work it does; `plan.ts` the pure rule choosing which
+  files it reads and what it writes. Its preconditions live in `compactHour`,
+  not in its callers: the scheduler and a hand-run backfill reach the same
+  function and only one of them knows the schedule. **A merged hour is only
+  ever trusted after it has been read back** — an existing `hour-<H>.parquet`
+  licenses the deletion of the rolls beside it only once those rolls' rows have
+  been shown to be in it.
 - `src/retention/expire.ts` — dropping whole date directories the retention
   window has passed. It imports no engine and is called at the end of a roll,
   after the roll's own files are in the tree. Read "Retention" below before

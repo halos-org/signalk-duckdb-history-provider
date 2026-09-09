@@ -2,7 +2,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { DATA_LAYOUT } from "../data-dir.js";
 
 /**
- * Where a roll's output goes.
+ * Every name in the tree, and the one rule that reads them.
  *
  * The tree carries time and nothing else: `parquet/date=<YYYY-MM-DD>/`, with
  * `context` and `path` as columns inside the file. That is the layout Unit 3a
@@ -12,6 +12,12 @@ import { DATA_LAYOUT } from "../data-dir.js";
  * Rows are placed by their own timestamp, not by when the roll ran. A roll
  * that spans midnight writes one file per date and stays correct; the roll
  * interval's divisibility rule is about the schedule, not about this.
+ *
+ * Beside the roll's names live the merge's — `compactedFile`, its temp, and
+ * `compactedHourFromName` — and the `coversHour` predicate that decides which
+ * rolls a merged hour holds. Three subsystems have to answer that identically:
+ * `liveTreeFiles` here for a reader, `planCompaction` for the merge, and
+ * `refuseMergedHour` for the roll. Two copies of the rule would be two answers.
  */
 
 /**
@@ -286,9 +292,9 @@ export function compactedHourCovering(
  *
  * The suppression is by id range, not by the set the merge actually read, so a
  * roll that lands in an already-merged hour would be dropped here too. That is
- * why `writeDay` refuses such an id outright: this function is allowed to
- * assume no roll ever arrives inside a merged hour, and the roll is what makes
- * the assumption true.
+ * why `refuseMergedHour` in `roll.ts` rejects such an id before the roll writes
+ * anything: this function is allowed to assume no roll ever arrives inside a
+ * merged hour, and the roll is what makes the assumption true.
  */
 export function liveTreeFiles(names: string[]): string[] {
   return names.filter((name) => {

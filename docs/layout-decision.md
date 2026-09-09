@@ -178,7 +178,14 @@ every layout lands within 100–180 ms there. A date directory is what makes
 long-range queries avoidable; path partitioning is what makes them slightly
 cheaper when they are not.
 
-## Why hourly
+## Why the interval was hourly, and why it is five minutes
+
+**Superseded in its conclusion, kept for its measurements.** This section
+prices the interval trade-off and concluded an hour. The default is now five
+minutes: what it holds is the hot store's ceiling near 50 MB, and an hour holds
+that at the rate measured here but not at ten times it. The file count that
+made an hour attractive below is the cost _Compaction: yes, hourly_ pays off —
+288 files a day merged back to 24, an hour behind.
 
 The interval sets three things, and they do not pull in the same direction.
 
@@ -209,15 +216,19 @@ larger it gets: streaming the snapshot two, four and nine times over, up to
 204–246 MB respectively, while wall time rises linearly to 15.5–15.9 s. Memory
 does not decide the interval.
 
-**File count.** 24 files a day, 720 in a thirty-day window, 8,760 in a year. The
+**File count.** At the hourly interval this section prices: 24 files a day, 720
+in a thirty-day window, 8,760 in a year. At the shipped five-minute interval it
+is 288 a day before compaction and 24 after. The
 aged-tree table above says 720 files answer a whole-range single-path query in
 931–1,169 ms and a date-scoped one in 116–152 ms.
 
 Fifteen-minute rolls would cut the recent-query floor from ~100 ms to ~63 ms and
 raise the file count fourfold, to 2,880 in a thirty-day window. That is a
-defensible other answer. Hourly is chosen because 24 files a day is already past
-the point where file count is doing any harm, and the remaining 40 ms is inside
-the startup cost of the process asking for it.
+defensible other answer, and it is the direction the default eventually went:
+hourly was chosen here because 24 files a day is already past the point where
+file count is doing any harm, and the remaining 40 ms is inside the startup cost
+of the process asking for it — an argument that only holds while nothing merges
+the files back.
 
 One constraint comes with it: the interval must divide 1,440 minutes, because
 "every N minutes from UTC midnight" describes a cadence only when it does. At
@@ -236,7 +247,9 @@ follows is to hold the hot store's ceiling near 50 MB rather than to hold the
 interval at an hour: ten times the rate wants a six-minute roll, at 240 files a
 day. Nothing in the flat layout objects to that — the roll cost at 38,970 rows
 is 109 MB and 1.0 s — but it is the roll interval, not the layout, that has to
-move, and the default of one hour is right for a rate near the one measured.
+move. An hour is right for a rate near the one measured and wrong above it,
+which is why the default moved to five minutes rather than staying at the rate
+this table happened to sample.
 
 ## Compaction: no, daily
 
