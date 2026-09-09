@@ -1,6 +1,9 @@
 import {
   closeSync,
+  constants,
   fchmodSync,
+  fchownSync,
+  fstatSync,
   fsyncSync,
   openSync,
   renameSync,
@@ -39,6 +42,13 @@ export function syncDirectory(directory: string): void {
   }
 }
 
+/** The uid and gid a committed file should carry, when they are not the
+ * committing process's own. `statSync` on the target directory produces it. */
+export interface FileOwner {
+  uid: number;
+  gid: number;
+}
+
 /**
  * Publish a file written under a temporary name.
  *
@@ -46,10 +56,38 @@ export function syncDirectory(directory: string): void {
  * rename makes it visible, then the directory entry reaches the disk. A
  * reader either sees the previous file or this one, never a partial one —
  * which is what lets the roll write into a tree something else is reading.
+ *
+ * **`O_NOFOLLOW`, and every mode change through the descriptor.** The temp
+ * lives in a directory the writing process does not necessarily own — the
+ * merge exists to be runnable by hand, as another user, over a tree Signal K
+ * owns. Anyone who can create names in that directory can replace the temp
+ * with a symlink between the write and this call, and a `chmod` or `chown` by
+ * path would then follow it: a process running as root would hand an arbitrary
+ * file to whoever set the link. `O_NOFOLLOW` refuses a symlink outright, and
+ * an open descriptor cannot be swapped afterwards.
+ *
+ * `owner` is for the caller whose uid differs from the tree's. Without it a
+ * merge run as root leaves a 0600 root-owned file in a tree the query service
+ * reads as another user — unreadable, with the rolls it superseded already
+ * unlinked.
  */
-export function commitFile(temp: string, final: string): void {
-  const fd = openSync(temp, "r");
+export function commitFile(
+  temp: string,
+  final: string,
+  owner?: FileOwner,
+): void {
+  const fd = openSync(temp, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
+    if (owner !== undefined) {
+      // Skipped when they already match, which is every in-process caller:
+      // `fchown` to the values a file already has is permitted for its owner,
+      // but asking for it needlessly turns a no-op into an EPERM on any
+      // filesystem that refuses the call outright.
+      const current = fstatSync(fd);
+      if (current.uid !== owner.uid || current.gid !== owner.gid) {
+        fchownSync(fd, owner.uid, owner.gid);
+      }
+    }
     // 0600, like the pid file and the pending-roll record. DuckDB creates its
     // output at 0666 & ~umask, which is 0644 by default — and the tree holds
     // the vessel's position history. The 0700 directory above it is the only
