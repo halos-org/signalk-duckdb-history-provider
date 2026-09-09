@@ -251,11 +251,14 @@ describe("compactHour", () => {
     // A merge that got as far as the rename and no further.
     const units = planCompaction(dir, HOUR);
     assert.equal(units.length, 1);
+    const inputs = units[0].inputs;
+    const saved = inputs.map((input) => `${input}.saved`);
+    for (const [i, input] of inputs.entries()) copyFileSync(input, saved[i]);
     await compactHour({ dataDir: dir, hourStartMs: HOUR });
-    // Put the inputs back, which is the state a killed merge leaves.
-    for (const input of units[0].inputs) {
-      copyFileSync(compactedFile(dir, HOUR, HOUR), input);
-    }
+    // Put the inputs back, byte for byte, which is the state a killed merge
+    // leaves.
+    for (const [i, input] of inputs.entries()) copyFileSync(saved[i], input);
+    for (const copy of saved) rmSync(copy);
 
     assert.deepEqual(await read(request), before);
   });
