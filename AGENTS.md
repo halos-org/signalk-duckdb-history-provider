@@ -87,16 +87,30 @@ a check on module evaluation alone.
   at
   [signalk-questdb-history-provider#23](https://github.com/halos-org/signalk-questdb-history-provider/issues/23).
 - `src/duckdb/` — version and platform naming, the bundled-extension resolver,
-  and the standalone offline check. Nothing here imports the engine either;
-  the resolver only finds and expands its binary.
+  and the standalone offline check. The resolver only finds and expands the
+  engine's binary and does not import it; `check-extension.ts` does import it,
+  and may, because it is a CLI that exits.
 - `src/roll/` — the roll. `main.ts` is the process the writer spawns, `roll.ts`
   the work it does, `schedule.ts` the every-N-minutes-from-UTC-midnight grid,
-  `tree-path.ts` the tree's paths. **`roll.ts` and `query/reader.ts` are the
-  only two files in the package that import `@duckdb/node-api`**, and they may
-  because everything importing either runs in a process that exits. The rule is
-  not "one directory owns the engine"; it is that the engine may never be
-  reachable from `src/index.ts` or from `src/writer/`, both of which run for as
-  long as recording does.
+  `tree-path.ts` the tree's paths and the hour rule the merge, the reader and
+  the roll all share. **The rule is not a file list and not "one directory owns
+  the engine": `@duckdb/node-api` may never be reachable from `src/index.ts` or
+  from `src/writer/`, both of which run for as long as recording does.**
+  Everything that does import it runs in its own process: `roll/roll.ts`,
+  `compact/compact.ts` and `duckdb/check-extension.ts` in one that exits,
+  `query/reader.ts` in the long-lived query service.
+  `src/test/plugin-import-graph.test.ts` checks the invariant against
+  the compiled plugin and writer; nothing checks a count, which is why the
+  count is not stated here.
+- `src/compact/` — the hourly merge. `main.ts` is the process the writer
+  spawns at a slot that closes an hour, whether or not that slot had rows to
+  roll; `compact.ts` the work it does; `plan.ts` the pure rule choosing which
+  files it reads and what it writes. Its preconditions live in `compactHour`,
+  not in its callers: the scheduler and a hand-run backfill reach the same
+  function and only one of them knows the schedule. **A merged hour is only
+  ever trusted after it has been read back** — an existing `hour-<H>.parquet`
+  licenses the deletion of the rolls beside it only once those rolls' rows have
+  been shown to be in it.
 - `src/retention/expire.ts` — dropping whole date directories the retention
   window has passed. It imports no engine and is called at the end of a roll,
   after the roll's own files are in the tree. Read "Retention" below before
@@ -134,10 +148,10 @@ a check on module evaluation alone.
 - `src/bench/` — the measurement harness. Every unit that reports a number
   reports it through this, so figures stay comparable.
 - `docs/layout-decision.md` — what the roll writes, how often, and why: one
-  Parquet file per roll under a dated directory, no path partitioning, no
-  compaction pass, plus a last-value sidecar. Read it before touching the roll
-  or the reader; the measurements behind each choice are in it, and so is what
-  would reopen one.
+  Parquet file per roll under a dated directory, no path partitioning, an
+  hourly compaction pass, plus a last-value sidecar. Read it before touching
+  the roll or the reader; the measurements behind each choice are in it, and so
+  is what reopened the compaction decision after it had been rejected once.
 - `docs/query-layer.md` — what a query costs, measured through the shipped
   reader: the 336–375 ms an engine takes to start, what a warm query costs
   against it, what the service holds while it waits, and the layout decision

@@ -4,6 +4,7 @@ import { rmSync, writeFileSync } from "node:fs";
 import { commitFile } from "../durable-write.js";
 import { fileURLToPath } from "node:url";
 import { delayToNextRoll, nextRollAt } from "../roll/schedule.js";
+import { HOUR_MS } from "../roll/tree-path.js";
 import {
   EXIT_NAME_TAKEN,
   ROLL_KILL_GRACE_MS,
@@ -29,7 +30,40 @@ import type { HotStore } from "./hot-store.js";
  * checks that against the compiled writer.
  */
 
+/**
+ * The merge's share of a roll interval: half of it, capped at five minutes.
+ *
+ * `arm()` re-reads the clock after `rollOnce` settles, so a merge allowed to
+ * run a whole interval costs a roll rather than delaying one. The smallest
+ * interval the writer accepts is one minute, which puts the smallest budget at
+ * 30 s -- against a merge measured at a few seconds on the device.
+ *
+ * Exported because driving it through the timeout would mean a test that waits
+ * out a real five minutes.
+ */
+export function compactBudgetMs(intervalMinutes: number): number {
+  return Math.min(COMPACT_TIMEOUT_MS, (intervalMinutes * 60_000) / 2);
+}
+
 const ROLL_ENTRY = fileURLToPath(new URL("../roll/main.js", import.meta.url));
+const COMPACT_ENTRY = fileURLToPath(
+  new URL("../compact/main.js", import.meta.url),
+);
+
+/**
+ * The most time a compaction gets before it is killed.
+ *
+ * Shorter than a roll's, because nothing is lost when a merge is cut off: its
+ * inputs are untouched until it has landed, while a roll that overruns never
+ * truncates and the store grows without bound.
+ *
+ * `compactTimeoutMs` caps this at half a roll interval, which is the part that
+ * matters at the shipped default of five minutes. `rollOnce` awaits the merge
+ * and `arm()` runs in its `.finally`, recomputing the next slot from the
+ * clock -- so a merge that outlasts the interval does not delay the next roll,
+ * it removes it, and that slot's rows wait for the one after.
+ */
+const COMPACT_TIMEOUT_MS = 5 * 60_000;
 
 /**
  * How long a roll gets before it is killed.
@@ -68,6 +102,13 @@ export interface RollSchedulerOptions {
   now?: () => number;
   /** Injected in tests, so a roll need not be a real DuckDB process. */
   spawnRoll?: (args: string[]) => ChildProcess;
+  /** Injected in tests, so a compaction need not be a real DuckDB process. */
+  spawnCompact?: (args: string[]) => ChildProcess;
+  /**
+   * Merge each completed hour's rolls into one file sorted by path. Off makes
+   * the tree exactly what it was before compaction existed.
+   */
+  compactHourly?: boolean;
   /** Injected in tests. Production waits ROLL_TIMEOUT_MS. */
   timeoutMs?: number;
   /** Injected in tests. Production waits START_ROLL_DELAY_MS. */
@@ -97,6 +138,13 @@ export class RollScheduler {
    * know nothing about.
    */
   private pending: PendingRoll | null;
+  /**
+   * The last hour handed to a merge, so each is merged once rather than once
+   * per roll inside it. In memory only: a restart re-offers the newest closed
+   * hour, and a merge of an hour already merged costs one spawn that finds
+   * nothing to do.
+   */
+  private lastCompactedHour: number | null = null;
 
   constructor(options: RollSchedulerOptions) {
     this.options = options;
@@ -233,6 +281,11 @@ export class RollScheduler {
       // Nothing recorded since the last roll. No file, no empty directory.
       this.pending = null;
       clearPendingRoll(this.options.dataDir, this.options.onError);
+      // Still the hour's only chance to be merged. An interval with nothing
+      // in it is ordinary at the shipped default, and hanging compaction off
+      // the tail of a successful roll alone left those hours uncompacted for
+      // ever -- there is no catch-up pass.
+      await this.compactClosedHour(slot);
       return;
     }
 
@@ -297,6 +350,7 @@ export class RollScheduler {
       `roll ${rollId} wrote ${outcome.summary}; ${removed} rows truncated`,
     );
     this.reportExpiry(outcome.result);
+    await this.compactClosedHour(slot);
   }
 
   /**
@@ -334,6 +388,168 @@ export class RollScheduler {
         ? `roll failed: ${problem.message}`
         : String(problem);
     (this.options.onError ?? this.options.log)(line);
+  }
+
+  /**
+   * Merge the hour this roll just closed, if it closed one.
+   *
+   * Runs here rather than on a timer of its own so it inherits the scheduler's
+   * serialisation: one child at a time, and never beside the roll whose files
+   * it is about to read. Every path to it has already cleared the pending-roll
+   * record, which is what keeps the seam correct -- `rolledOverlap` resolves a
+   * pending roll by looking for `<rollId>.parquet`, and a merge that renamed
+   * those rows under a new name while the record still pointed at the old one
+   * would make the seam conclude the tree does not hold them. The check itself
+   * is in `compactHour`, which reads the record from disk: an unreachable
+   * branch here would be a guard nobody could test, and the standalone entry
+   * point needs the rule more than this caller does.
+   *
+   * A failure is logged and nothing else. The merge touches no hot store row,
+   * so there is nothing here that can cost recording.
+   */
+  private async compactClosedHour(slot: number): Promise<void> {
+    if (this.options.compactHourly === false) return;
+    if (this.stopped) return;
+    // An hour holds at most one roll at this interval, and one file is not
+    // worth rewriting under a second name. Checked before the spawn, because
+    // the child's first act is to map the engine's ~100 MB addon -- once an
+    // hour, for ever, to find nothing to do. This is the upgrade path for
+    // every install that has not changed the interval.
+    if (this.options.intervalMinutes >= 60) return;
+
+    // The newest hour every roll of which is on disk: the largest hour start
+    // at or below `slot - 1h`. Not `slot % HOUR_MS === 0` -- that triggered
+    // only on rolls landing exactly on the hour, so of the ten legal intervals
+    // that divide 1440 but not 60 it compacted a fraction of the hours and
+    // left the rest for ever. At 45 minutes it caught 8 of 24.
+    const hour = Math.floor((slot - HOUR_MS) / HOUR_MS) * HOUR_MS;
+    if (hour < 1) return;
+    // Once per hour rather than once per roll. Every roll inside an hour names
+    // the same closed hour below it, and a merge of an hour already merged is
+    // a spawn that maps the engine to find nothing to do.
+    if (this.lastCompactedHour !== null && hour <= this.lastCompactedHour) {
+      return;
+    }
+
+    const outcome = await this.runCompaction(hour);
+    if (!outcome.ok) {
+      // Deliberately not recorded as done. Every reachable failure here is a
+      // transient -- a spawn that could not get memory, the SIGKILL at the
+      // timeout, an EIO on a failing card -- and recording the hour before
+      // awaiting the child meant any one of them cost that hour for the life
+      // of the writer, with no catch-up pass anywhere. The next roll inside
+      // the same hour retries, and the hour stops being offered once it
+      // closes.
+      //
+      // The message does not claim the rolls are untouched. A merge killed
+      // after `commitFile` has already renamed one unit into place, and from
+      // that instant `liveTreeFiles` stops returning the rolls it superseded.
+      this.reportFailure(
+        `compacting the hour starting ${hour} did not finish (${outcome.why}); ` +
+          `it may have merged part of the hour before stopping, so re-run ` +
+          `compact/main.js --hour ${hour} to finish it`,
+      );
+      return;
+    }
+    this.lastCompactedHour = hour;
+    if (outcome.report === null) return;
+    this.options.log(outcome.report.line);
+    // On the error sink, not in the line above. Each of these names a state an
+    // operator has to act on, and each carries the command that acts on it --
+    // nothing else in the system revisits an hour once it has been merged.
+    if (outcome.report.strays > 0) {
+      this.reportFailure(
+        `the merge of the hour starting ${hour} could not remove ` +
+          `${outcome.report.strays} of the roll files it folded in; no query ` +
+          `reads them and no retention counts them. Re-run ` +
+          `compact/main.js --hour ${hour} to remove them`,
+      );
+    }
+    if (outcome.report.quarantined > 0) {
+      this.reportFailure(
+        `the hour starting ${hour} already held a merged file that could not ` +
+          `be read; it was renamed aside and the hour merged again from the ` +
+          `rolls that survived. A file that will not read after an fsync means ` +
+          `the storage lost bytes it acknowledged`,
+      );
+    }
+    if (outcome.report.orphans > 0) {
+      this.reportFailure(
+        `${outcome.report.orphans} roll file(s) in the hour starting ${hour} ` +
+          `hold rows the merged file does not, so they were left where they ` +
+          `are. No query reads them: recover their rows before removing them`,
+      );
+    }
+  }
+
+  private runCompaction(
+    hour: number,
+  ): Promise<
+    { ok: true; report: CompactionReport | null } | { ok: false; why: string }
+  > {
+    const args = [
+      COMPACT_ENTRY,
+      "--data-dir",
+      this.options.dataDir,
+      "--hour",
+      String(hour),
+    ];
+    const child = (this.options.spawnCompact ?? defaultSpawn)(args);
+    this.running = child;
+
+    return new Promise((resolve) => {
+      let out = "";
+      let err = "";
+      let settled = false;
+      const settle = (
+        result:
+          | { ok: true; report: CompactionReport | null }
+          | { ok: false; why: string },
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(killer);
+        this.running = null;
+        resolve(result);
+      };
+      child.stdout?.on("data", (chunk: Buffer) => (out += chunk.toString()));
+      child.stderr?.on("data", (chunk: Buffer) => (err += chunk.toString()));
+      child.stdout?.on("error", () => {});
+      child.stderr?.on("error", () => {});
+      child.on("error", (error) =>
+        settle({ ok: false, why: (error as Error).message }),
+      );
+      const budget =
+        this.options.timeoutMs ?? compactBudgetMs(this.options.intervalMinutes);
+      const killer = setTimeout(() => {
+        child.kill("SIGKILL");
+        settle({ ok: false, why: `it ran past ${budget} ms` });
+      }, budget);
+      killer.unref();
+      // `close`, not `exit`, for the reason `runRoll` gives: exit can fire
+      // while the last line is still in the pipe, and that line is the merge's
+      // whole report -- including the stray inputs an operator has to see.
+      child.on("close", (code, signal) => {
+        if (code !== 0) {
+          const how = code === null ? `signal ${signal}` : `code ${code}`;
+          // The last non-empty line, not the first: the merge logs each unit
+          // it finished to stderr, and `compact/main.js` writes the error
+          // after them.
+          const reason =
+            err
+              .split("\n")
+              .map((line) => line.trim())
+              .filter((line) => line !== "")
+              .at(-1) ?? "";
+          settle({
+            ok: false,
+            why: reason === "" ? `it exited ${how}` : `${how}: ${reason}`,
+          });
+          return;
+        }
+        settle({ ok: true, report: summariseCompaction(out) });
+      });
+    });
   }
 
   private runRoll(
@@ -418,7 +634,13 @@ export class RollScheduler {
   }
 
   /**
-   * Disarm the timer and kill a roll in flight.
+   * Disarm the timer and kill whichever child is in flight.
+   *
+   * That is a roll or a merge: `runCompaction` takes the same `this.running`
+   * handle. Killing a merge costs a `.tmp` the next sweep collects and an hour
+   * the next roll offers again; killing it after one unit has been renamed
+   * into place leaves that unit's rolls superseded and unremoved, which the
+   * failure line tells the operator to finish by hand.
    *
    * It does not promise that nothing is truncated: a roll that exits 0 while
    * this waits has done its work, and `rollOnce` goes on to delete the rows it
@@ -579,4 +801,64 @@ function describe(result: RollSummary): string {
       ? `, expiring ${result.expired.join(", ")}`
       : "";
   return `${result.rows} rows to ${dates} and ${result.sidecarRows} sidecar rows${peak}${expired}`;
+}
+
+/**
+ * What the scheduler takes from the merge's JSON line: one line to log, and
+ * three counts that go to the error sink alone, because each names a state an
+ * operator has to act on.
+ */
+interface CompactionReport {
+  line: string;
+  strays: number;
+  quarantined: number;
+  orphans: number;
+}
+
+/**
+ * What a merge did, or null when it did nothing at all.
+ *
+ * Parsed rather than trusted: the process prints JSON on success, and a build
+ * mismatch or a truncated pipe should read as "no summary" rather than as an
+ * exception inside the scheduler.
+ */
+function summariseCompaction(stdout: string): CompactionReport | null {
+  try {
+    const parsed = JSON.parse(stdout.trim().split("\n").pop() ?? "") as {
+      hourStartMs?: number;
+      files?: { rows: number; bytesIn: number; bytesOut: number }[];
+      alreadyCompacted?: string[];
+      quarantined?: string[];
+      orphanInputs?: string[];
+      strayInputs?: string[];
+    };
+    const files = parsed.files ?? [];
+    const strays = parsed.strayInputs?.length ?? 0;
+    const quarantined = parsed.quarantined?.length ?? 0;
+    const orphans = parsed.orphanInputs?.length ?? 0;
+    const superseded = parsed.alreadyCompacted?.length ?? 0;
+    if (
+      files.length === 0 &&
+      strays === 0 &&
+      quarantined === 0 &&
+      orphans === 0 &&
+      superseded === 0
+    ) {
+      return null;
+    }
+    const rows = files.reduce((sum, file) => sum + file.rows, 0);
+    const bytesIn = files.reduce((sum, file) => sum + file.bytesIn, 0);
+    const bytesOut = files.reduce((sum, file) => sum + file.bytesOut, 0);
+    return {
+      line:
+        `compacted the hour starting ${parsed.hourStartMs ?? "?"}: ` +
+        `${files.length} file(s), ${rows} rows, ${bytesIn} -> ${bytesOut} bytes` +
+        (superseded > 0 ? `; ${superseded} already merged and left alone` : ""),
+      strays,
+      quarantined,
+      orphans,
+    };
+  } catch {
+    return null;
+  }
 }

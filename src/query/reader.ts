@@ -12,6 +12,7 @@ import {
 import { sqlLiteral } from "../duckdb/sql.js";
 import {
   dateDirectoryStart,
+  liveTreeFiles,
   sidecarFile,
   treeRoot,
 } from "../roll/tree-path.js";
@@ -22,9 +23,11 @@ import type { QueryRequest, ValueAggregate } from "./duck.js";
 /**
  * The hot store and the Parquet tree, read as one.
  *
- * This runs in the query service — it is the only file besides `roll/roll.ts`
- * that may import the engine, and it may because that process is not the
- * Signal K server. Everything is one statement: the tree files that intersect
+ * This runs in the query service — one of the few files that may import the
+ * engine, and it may because that process is not the Signal K server. The rule
+ * is not a file list: the engine may never be reachable from `src/index.ts` or
+ * from `src/writer/`, and everything that imports it runs in a process that
+ * exits. Everything is one statement: the tree files that intersect
  * the range, the unrolled remainder of the hot store, and one filter over
  * both.
  *
@@ -109,7 +112,11 @@ export interface ReadResult {
 interface TreeFile {
   day: number;
   path: string;
-  /** The file's own name, which is the id of the roll that wrote it. */
+  /**
+   * The file's own name: `<rollId>.parquet` for a roll, `hour-<ms>.parquet`
+   * for a merged hour. Nothing parses it; `rolledOverlap` compares whole
+   * names and the query reads `path`.
+   */
   name: string;
 }
 
@@ -610,7 +617,10 @@ export function treeFilesInRange(
     } catch {
       continue; // Removed between the two reads, by expiry or by hand.
     }
-    for (const name of names.sort()) {
+    // A compacted file supersedes the rolls it folded in, and the merge
+    // unlinks those afterwards rather than atomically with its own rename.
+    // Reading both would answer every row in the hour twice.
+    for (const name of liveTreeFiles(names).sort()) {
       if (!name.endsWith(".parquet")) continue;
       found.push({ day, name, path: join(directory, name) });
     }

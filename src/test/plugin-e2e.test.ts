@@ -144,35 +144,68 @@ describe("a delta reaching the writer's store", () => {
     }
   });
 
-  it("hands the writer the roll interval and the retention it was configured with", async () => {
-    // Both cross a process boundary as command-line flags, so a name the two
-    // sides spell differently would mean rolling on the default and keeping
-    // everything for ever, with nothing failing anywhere.
-    const base = mkdtempSync(join(tmpdir(), "sk-parquet-e2e-"));
-    const paths = writerPaths(base);
-    const { app, calls } = stubApp(base);
-    const plugin = createPlugin(app);
-    try {
-      plugin.start({ rollIntervalMinutes: 30, retentionDays: 14 });
+  /**
+   * Every one of these crosses a process boundary as a command-line flag, so a
+   * name the two sides spell differently would mean rolling on the default,
+   * keeping everything for ever, or compacting a tree an operator asked to
+   * leave alone — with nothing failing anywhere. The writer reports back what
+   * it was actually given, which is the only place the two spellings meet.
+   */
+  for (const { compactHourly, interval, expected } of [
+    {
+      compactHourly: true,
+      interval: 30,
+      expected: "compacting each completed hour",
+    },
+    {
+      compactHourly: false,
+      interval: 30,
+      expected: "not compacting: turned off",
+    },
+    // The flag is on and the merge still cannot run: an hour holds one roll at
+    // this interval. Reporting the flag here would tell exactly the devices
+    // that get no merge that they are being merged.
+    {
+      compactHourly: true,
+      interval: 60,
+      expected: "not compacting: a 60-minute roll already fills an hour",
+    },
+  ]) {
+    it(`reports the writer's effective compaction at ${interval} minutes with the flag ${compactHourly ? "on" : "off"}`, async () => {
+      const base = mkdtempSync(join(tmpdir(), "sk-parquet-e2e-"));
+      const paths = writerPaths(base);
+      const { app, calls } = stubApp(base);
+      const plugin = createPlugin(app);
+      try {
+        plugin.start({
+          rollIntervalMinutes: interval,
+          retentionDays: 14,
+          compactHourly,
+        });
 
-      await eventually(
-        () => calls.debug.some((line) => line.includes("writer ready")),
-        `the writer to report itself (errors: ${JSON.stringify(calls.errors)})`,
-      );
-      assert.match(
-        calls.debug.join("\n"),
-        /rolling every 30 minutes, keeping 14 days/,
-      );
-    } finally {
-      await plugin.stop();
-      await eventually(
-        () => !existsSync(paths.pidFile),
-        "the writer to clean up after itself",
-        10_000,
-      ).catch(() => {});
-      rmSync(base, { recursive: true, force: true });
-    }
-  });
+        // The writer prints its ready line and the effective configuration
+        // in one write, but the plugin relays each stdout chunk as its own
+        // debug call, so wait for the whole pattern rather than for the
+        // ready line alone.
+        const effective = new RegExp(
+          `rolling every ${interval} minutes, keeping 14 days, ` +
+            expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        );
+        await eventually(
+          () => effective.test(calls.debug.join("\n")),
+          `the writer to report "${expected}" (errors: ${JSON.stringify(calls.errors)})`,
+        );
+      } finally {
+        await plugin.stop();
+        await eventually(
+          () => !existsSync(paths.pidFile),
+          "the writer to clean up after itself",
+          10_000,
+        ).catch(() => {});
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("survives a writer that cannot be spawned at all", async () => {
     // A ChildProcess with no `error` listener rethrows the event, and the throw

@@ -147,8 +147,10 @@ process for the life of the plugin, and this is what that costs.
 ## The layout decision, re-checked
 
 `docs/layout-decision.md` chose one file per roll, no path partitioning and no
-compaction, and named what would reopen it: a multi-day query dominated by
-per-file cost rather than by startup.
+_daily_ compaction, and named what would reopen it: a multi-day query dominated
+by per-file cost rather than by startup. What reopened it in the end was the
+roll interval rather than the query — see the closing paragraph of this
+section.
 
 Both trees below are one day of real data hard-linked into 30 dated
 directories, with no hot store. The rows therefore repeat, and a 30-day range
@@ -173,10 +175,19 @@ and 240 files all answer a one-day single-path range in 360–444 ms. That is th
 property the layout was chosen for, and it is the reason a long-range query
 stays avoidable rather than fast.
 
-So the decision stands: no compaction pass, no path partitioning. What would
-reopen it is a _real_ thirty-day tree — 720 files at hourly rolls — where the
-same per-file slope predicts ~720 ms of planning. That is worth re-measuring
-once a device has one, and it is not worth pre-emptively engineering for.
+So the decision stood at the time of these measurements: no compaction pass, no
+path partitioning. What would reopen it is a _real_ thirty-day tree — 720 files
+at hourly rolls — where the same per-file slope predicts ~720 ms of planning.
+
+**That threshold has since been crossed, by the roll interval rather than by
+time.** The default is now 5 minutes, so thirty days is 8,640 files, not 720,
+and the ~1 ms per file measured above prices that at several seconds of
+planning. Path partitioning is still rejected. Hourly compaction is not: it
+brings thirty days back to 720 files, and on a device it took a single-path
+range over one day's files from 42.2 ms to 3.4 ms. `docs/layout-decision.md`,
+_Compaction: yes, hourly_, has the numbers and the safety argument.
+
+No path partitioning, still.
 
 `getPaths` is a scan rather than a directory listing, and the flat layout is
 why. The cumulative sidecar could answer "every path ever" from one 11 kB file,
