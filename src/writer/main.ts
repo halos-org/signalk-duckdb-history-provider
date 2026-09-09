@@ -118,9 +118,14 @@ async function main(): Promise<void> {
   // The settings this process was actually given, not the ones the Admin UI
   // shows. They arrive as arguments, and a flag the plugin and this side spell
   // differently would otherwise mean silently keeping everything for ever.
+  // Present-means-off, like --replace on the roll: the plugin passes the flag
+  // only when an operator turned compaction off, so a writer started by an
+  // older plugin compacts, which is the default.
+  const compactHourly = !process.argv.includes("--no-compact");
   process.stdout.write(
     `writer ready on ${paths.socket}, rolling every ${rollIntervalMinutes} minutes, ` +
-      `keeping ${retentionUsable === 0 ? "everything" : `${retentionUsable} days`}\n`,
+      `keeping ${retentionUsable === 0 ? "everything" : `${retentionUsable} days`}, ` +
+      `${compactHourly ? "compacting" : "not compacting"} each completed hour\n`,
   );
 
   // The roll runs here rather than in the plugin because only this process may
@@ -131,10 +136,7 @@ async function main(): Promise<void> {
     dataDir,
     intervalMinutes: rollIntervalMinutes,
     retentionDays: retentionUsable,
-    // Present-means-off, like --replace on the roll: the plugin passes the
-    // flag only when an operator turned compaction off, so a writer started
-    // by an older plugin compacts, which is the default.
-    compactHourly: !process.argv.includes("--no-compact"),
+    compactHourly,
     log: (line) => process.stdout.write(`${line}\n`),
     // stderr, because the plugin routes it to app.error while stdout goes to
     // app.debug. A roll failure nobody sees is the shape this whole design
