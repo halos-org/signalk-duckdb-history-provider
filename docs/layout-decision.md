@@ -255,7 +255,7 @@ this table happened to sample.
 
 **Superseded — see _Compaction: yes, hourly_ below.** This section priced a
 _daily_ pass and rejected it, and the rejection still holds for that shape. The
-hourly pass that ships is a different unit with a different peak, and it exists
+hourly pass is a different unit with a different peak, and it exists
 because a later decision made the roll interval twelve times shorter.
 
 Compaction would merge a day of roll files into one file per partition. Its only
@@ -293,7 +293,7 @@ interval has to hold and 5 minutes holds it at rates an hour does not. That
 turns 24 files a day into 288, and 720 files for thirty days into 8,640 — well
 past the file count the section above named as the warning sign.
 
-The pass that ships merges **one completed hour**, not a day, and it is the
+The hourly pass merges **one completed hour**, not a day, and it is the
 sort that pays rather than the file count:
 
 |                                         |                  |
