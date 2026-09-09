@@ -1,4 +1,4 @@
-import { chownSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { DATA_DIR_MODE, DATA_LAYOUT } from "../data-dir.js";
@@ -51,11 +51,24 @@ export interface CompactResult {
   hourStartMs: number;
   files: CompactedFile[];
   /**
-   * Outputs that were already on disk. Their surviving inputs were removed,
-   * never re-merged.
+   * Outputs that were already on disk and were read back to prove they hold
+   * every row of the leftovers beside them. Those leftovers were removed.
    */
   alreadyCompacted: string[];
-  /** Inputs that were merged and then could not be removed. Reported, not fatal. */
+  /**
+   * Existing outputs that could not be read. Renamed aside rather than
+   * trusted, and their hour merged again from the rolls that survived.
+   */
+  quarantined: string[];
+  /**
+   * Leftover rolls beside an existing output that does not hold their rows.
+   * Left exactly where they are: they may be the only copy.
+   */
+  orphanInputs: string[];
+  /**
+   * Inputs this run folded in, or found already folded in, and then could not
+   * remove. Reported, not fatal.
+   */
   strayInputs: string[];
 }
 
@@ -100,9 +113,14 @@ export async function compactHour(
     );
   }
   // A roll in flight is a roll whose file is not on disk. Merging past it
-  // would leave it to arrive into a merged hour -- which `writeDay` now
-  // refuses, so the cost is stopped recording rather than lost rows, and the
-  // cheaper answer is to wait for the next hour boundary.
+  // would leave it to arrive into a merged hour -- which `refuseMergedHour`
+  // rejects, so the cost is one deferred roll rather than lost rows, and
+  // waiting for the next hour boundary is cheaper than paying it.
+  //
+  // Belt and braces behind the claim on the data directory that `main.ts`
+  // takes: this record is written best-effort and read fail-open, so it cannot
+  // be the interlock. It catches a roll this process is not racing -- one left
+  // unfinished by a writer that died.
   const pending = readPendingRoll(dataDir);
   if (pending !== null && coversHour(pending.rollId, hourStartMs)) {
     throw new Error(
@@ -112,69 +130,155 @@ export async function compactHour(
   }
 
   const units = planCompaction(dataDir, hourStartMs);
-  const toMerge = units.filter((unit) => !unit.alreadyMerged);
-  const alreadyCompacted = units
-    .filter((unit) => unit.alreadyMerged)
-    .map((unit) => unit.output);
-
   const files: CompactedFile[] = [];
+  const alreadyCompacted: string[] = [];
+  const quarantined: string[] = [];
+  const orphanInputs: string[] = [];
   const strayInputs: string[] = [];
-  if (toMerge.length > 0) {
-    // Its own scratch, for the same reason the roll takes one: an in-memory
-    // database spills relative to the working directory, which for a process
-    // the writer spawned is the Signal K server's.
-    const scratchRoot = join(dataDir, DATA_LAYOUT.scratch);
-    mkdirSync(scratchRoot, { recursive: true, mode: DATA_DIR_MODE });
-    const scratch = join(scratchRoot, `compact-${hourStartMs}-${process.pid}`);
-    mkdirSync(scratch, { recursive: true, mode: DATA_DIR_MODE });
-
-    const instance = await DuckDBInstance.create(":memory:", {
-      ...BASE_DUCKDB_CONFIG,
-      memory_limit: options.memoryLimit ?? DEFAULT_MEMORY_LIMIT,
-      temp_directory: scratch,
-    });
-    const connection = await instance.connect();
-    try {
-      // Nothing here loads an extension or attaches a database, so the
-      // lockdown can go on immediately. The merge reads and writes only inside
-      // the data directory; this is containment for the next statement added
-      // to this file rather than for any statement in it today.
-      await lockDownFileAccess(connection, [dataDir]);
-      for (const unit of toMerge) {
-        files.push(await mergeUnit(connection, unit, options.log));
-      }
-    } finally {
-      connection.closeSync();
-      instance.closeSync();
-      rmSync(scratch, { recursive: true, force: true });
-      // Every failure path, not only the ones that threw before the rename: a
-      // COPY killed part way leaves a `.tmp` in a date directory, and for the
-      // unit of a midnight-spanning hour that directory is yesterday's, which
-      // no later roll sweeps.
-      for (const unit of toMerge) rmSync(unit.temp, { force: true });
-    }
-    // Only after every unit has landed. A roll that spans midnight wrote the
-    // same hour into two directories, and unlinking one directory's inputs
-    // while the other's merge is still to come would leave the hour half
-    // readable if this process died between them.
-    for (const unit of toMerge) strayInputs.push(...unlinkInputs(unit));
+  if (units.length === 0) {
+    return {
+      hourStartMs,
+      files,
+      alreadyCompacted,
+      quarantined,
+      orphanInputs,
+      strayInputs,
+    };
   }
 
-  // The leftovers of an interrupted merge. By `liveTreeFiles`'s rule the
-  // existing output already supersedes them, so removing them is finishing the
-  // step that was interrupted -- and it is the only safe action, because
-  // re-merging would rename a fraction of the hour over the whole of it.
+  // Its own scratch, for the same reason the roll takes one: an in-memory
+  // database spills relative to the working directory, which for a process the
+  // writer spawned is the Signal K server's.
+  const scratchRoot = join(dataDir, DATA_LAYOUT.scratch);
+  mkdirSync(scratchRoot, { recursive: true, mode: DATA_DIR_MODE });
+  const scratch = join(scratchRoot, `compact-${hourStartMs}-${process.pid}`);
+  mkdirSync(scratch, { recursive: true, mode: DATA_DIR_MODE });
+
+  const instance = await DuckDBInstance.create(":memory:", {
+    ...BASE_DUCKDB_CONFIG,
+    memory_limit: options.memoryLimit ?? DEFAULT_MEMORY_LIMIT,
+    temp_directory: scratch,
+  });
+  const connection = await instance.connect();
+  const toMerge = units.filter((unit) => !unit.alreadyMerged);
+  try {
+    // Nothing here loads an extension or attaches a database, so the lockdown
+    // can go on immediately. The merge reads and writes only inside the data
+    // directory; this is containment for the next statement added to this file
+    // rather than for any statement in it today.
+    await lockDownFileAccess(connection, [dataDir]);
+
+    // **An existing output is a claim, not a fact.** Every leftover roll beside
+    // it is a file whose rows the hot store truncated when it landed, so
+    // removing one is a deletion of the only copy — and the thing that licenses
+    // it must be the rows, never a directory entry. The rest of this package
+    // holds that line already: the roll reads `count(*)` back from its own
+    // committed file and the scheduler compares it against the bound before
+    // truncating, and `mergeUnit` below compares written against read before it
+    // renames. This is the same boundary.
+    for (const unit of units) {
+      if (!unit.alreadyMerged) continue;
+      const held = await outputHolds(connection, unit);
+      if (held === "unreadable") {
+        // Renamed aside rather than deleted, the way `writeSidecar` handles an
+        // unreadable sidecar, and for the same cause: flash that acknowledges a
+        // flush without writing leaves the rename and loses the bytes. Moving
+        // it also un-breaks every query over this whole date, because the
+        // reader passes the directory to one `read_parquet` list and one
+        // unreadable member fails the statement.
+        renameSync(unit.output, `${unit.output}.unreadable`);
+        quarantined.push(unit.output);
+        // The survivors are now the only copy of the hour, so merge them.
+        toMerge.push(unit);
+        continue;
+      }
+      if (held === "complete") {
+        alreadyCompacted.push(unit.output);
+        continue;
+      }
+      // Rows in the leftovers that the output does not hold. This is the state
+      // a roll written into an already-merged hour leaves, and deleting it is
+      // how a hidden roll becomes a lost one.
+      orphanInputs.push(...unit.inputs);
+    }
+
+    for (const unit of toMerge) {
+      files.push(await mergeUnit(connection, unit, options.log));
+    }
+  } finally {
+    connection.closeSync();
+    instance.closeSync();
+    rmSync(scratch, { recursive: true, force: true });
+    // Cheap insurance rather than the mechanism: a throw between the COPY and
+    // the rename leaves a temp, and this removes it. It cannot cover the case
+    // that actually produces one -- a process killed mid-COPY never reaches a
+    // `finally` -- which is what `sweepStaleTemporaries` below is for.
+    for (const unit of units) rmSync(unit.temp, { force: true });
+  }
+
+  // Only after every unit has landed. A roll that spans midnight wrote the same
+  // hour into two directories, and unlinking one directory's inputs while the
+  // other's merge is still to come would leave the hour half readable if this
+  // process died between them.
+  for (const unit of toMerge) strayInputs.push(...unlinkInputs(unit));
+  // The leftovers of an interrupted merge, now that the output has been read
+  // back and shown to hold them. Removing them is finishing the step the
+  // interrupted run did not reach.
   for (const unit of units) {
     if (!unit.alreadyMerged) continue;
+    if (!alreadyCompacted.includes(unit.output)) continue;
     options.log?.(
-      `${unit.output} already holds this hour; removing ${unit.inputs.length} ` +
-        `superseded input(s) rather than merging again`,
+      `${unit.output} was read back and holds this hour; removing ` +
+        `${unit.inputs.length} superseded input(s) rather than merging again`,
     );
     strayInputs.push(...unlinkInputs(unit));
   }
 
   for (const unit of units) sweepStaleTemporaries(unit.directory);
-  return { hourStartMs, files, alreadyCompacted, strayInputs };
+  return {
+    hourStartMs,
+    files,
+    alreadyCompacted,
+    quarantined,
+    orphanInputs,
+    strayInputs,
+  };
+}
+
+/**
+ * Whether an output already on disk holds every row of the leftovers beside it.
+ *
+ * Rows, not counts: a count can match while the rows differ, and what licenses
+ * the delete is that these exact rows are already somewhere else. `EXCEPT ALL`
+ * keeps duplicates apart, so a leftover holding a row twice is only covered by
+ * an output holding it twice.
+ *
+ * A leftover that cannot be read counts as not held. It is then left alone,
+ * which is right either way: unreadable here does not mean unreadable to a
+ * later engine, and it is not this function's business to delete it.
+ */
+async function outputHolds(
+  connection: Awaited<ReturnType<DuckDBInstance["connect"]>>,
+  unit: CompactionUnit,
+): Promise<"complete" | "incomplete" | "unreadable"> {
+  try {
+    await countRows(connection, `'${sqlLiteral(unit.output)}'`);
+  } catch {
+    return "unreadable";
+  }
+  const list = unit.inputs.map((path) => `'${sqlLiteral(path)}'`).join(", ");
+  try {
+    const missing = await connection.runAndReadAll(
+      `SELECT count(*) FROM (` +
+        `SELECT ${COLUMN_LIST} FROM read_parquet([${list}], union_by_name = true) ` +
+        `EXCEPT ALL ` +
+        `SELECT ${COLUMN_LIST} FROM read_parquet('${sqlLiteral(unit.output)}')` +
+        `)`,
+    );
+    return Number(missing.getRowsJS()[0][0]) === 0 ? "complete" : "incomplete";
+  } catch {
+    return "incomplete";
+  }
 }
 
 async function mergeUnit(
@@ -211,16 +315,16 @@ async function mergeUnit(
     );
   }
 
-  // The tree's owner, not the merge's. `commitFile` fchmods to 0600 and the
-  // file belongs to whoever ran the process -- so a merge run as root over a
-  // tree Signal K owns leaves an hour the query service cannot open, with the
-  // rolls that were readable already unlinked. Before the rename and before
-  // any unlink, so a refusal costs nothing.
-  inheritOwner(unit.directory, unit.temp);
-
-  // Atomic for this one file, and from here the reader stops seeing the
-  // inputs -- `liveTreeFiles` drops a roll an existing merge supersedes.
-  commitFile(unit.temp, unit.output);
+  // Atomic for this one file, and from here the reader stops seeing the inputs
+  // -- `liveTreeFiles` drops a roll an existing merge supersedes.
+  //
+  // The owner is the tree's, not the merge's. `commitFile` fchmods to 0600 and
+  // the file belongs to whoever ran the process, so a merge run by hand as
+  // another user leaves an hour the query service cannot open, with the rolls
+  // that were readable already unlinked. `commitFile` does it on the same
+  // descriptor it fsyncs, which is what stops the temp being swapped for a
+  // symlink between the check and the change.
+  commitFile(unit.temp, unit.output, statSync(unit.directory));
 
   const result: CompactedFile = {
     path: unit.output,
@@ -246,20 +350,6 @@ async function countRows(
 }
 
 /**
- * Give a file the uid and gid of the directory it is going into.
- *
- * A no-op whenever they already match, which is every in-process merge the
- * writer spawns. It matters for a merge run by hand as another user, where the
- * only alternative is an unreadable hour.
- */
-function inheritOwner(directory: string, path: string): void {
-  const owner = statSync(directory);
-  const file = statSync(path);
-  if (file.uid === owner.uid && file.gid === owner.gid) return;
-  chownSync(path, owner.uid, owner.gid);
-}
-
-/**
  * Remove the rolls the merge folded in.
  *
  * Deliberately after the rename and deliberately not atomic with it: a file
@@ -282,9 +372,11 @@ function unlinkInputs(unit: CompactionUnit): string[] {
 /**
  * Collect `.tmp` files an earlier merge or roll abandoned in this directory.
  *
- * The roll sweeps only the directory it is writing to, and the hour that spans
- * midnight leaves its temp in the day before -- a directory no later roll ever
- * touches again.
+ * By age, not by exclusion: this run's own temps are already gone by the time
+ * it runs, and the window has to be wide enough that it never removes one a
+ * concurrent process is still writing. The roll sweeps only the directory it is
+ * writing to, and an hour that spans midnight leaves its temp in the day
+ * before -- a directory no later roll ever touches again.
  */
 function sweepStaleTemporaries(directory: string): void {
   const cutoff = Date.now() - STALE_TEMP_MS;

@@ -18,13 +18,11 @@ import {
  * row's own timestamp names and a set chosen by content could only be found by
  * reading every file first.
  *
- * `HOUR_MS` and `coversHour` are re-exported from `roll/tree-path.ts` rather
- * than declared here. The reader's suppression rule, the roll's refusal and
- * this planner have to be the same predicate, and one of them living in a
- * module the other two do not import is how they would drift apart.
+ * The hour predicate itself is `coversHour` in `roll/tree-path.ts`, beside the
+ * names it reads. The reader's suppression rule, the roll's refusal and this
+ * planner have to be the same predicate, and one of them living in a module
+ * the other two do not import is how they would drift apart.
  */
-
-export { HOUR_MS, coversHour } from "../roll/tree-path.js";
 
 /** One date directory's share of an hour. A roll spanning midnight has two. */
 export interface CompactionUnit {
@@ -62,7 +60,6 @@ export interface CompactionUnit {
 export function planCompaction(
   dataDir: string,
   hourStartMs: number,
-  pid: number = process.pid,
 ): CompactionUnit[] {
   const root = treeRoot(dataDir);
   let entries: string[];
@@ -97,7 +94,7 @@ export function planCompaction(
       directory,
       inputs,
       output,
-      temp: compactedTempFile(dataDir, day, hourStartMs, pid),
+      temp: compactedTempFile(dataDir, day, hourStartMs, process.pid),
       alreadyMerged,
     });
   }

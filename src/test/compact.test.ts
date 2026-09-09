@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
@@ -8,12 +8,18 @@ import {
   mkdtempSync,
   readdirSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { compactHour } from "../compact/compact.js";
-import { HOUR_MS, planCompaction } from "../compact/plan.js";
+import { claimTheDataDirectory } from "../writer/claim.js";
+import { EXIT_LOCKED } from "../writer/contract.js";
+import { RollScheduler } from "../writer/roll-scheduler.js";
+import { planCompaction } from "../compact/plan.js";
+import { HOUR_MS } from "../roll/tree-path.js";
 import { DATA_LAYOUT } from "../data-dir.js";
 import { QueryRunner } from "../query/duck.js";
 import type { QueryRequest } from "../query/duck.js";
@@ -30,6 +36,12 @@ import type { Sample } from "../writer/protocol.js";
  * The assertion that matters is not that the merge produced a file: it is that
  * a query cannot tell the difference. Every row, once, in the same order.
  */
+
+const COMPACT_ENTRY = join(
+  resolve(dirname(fileURLToPath(import.meta.url)), ".."),
+  "compact",
+  "main.js",
+);
 
 const DAY = Date.UTC(2026, 8, 2);
 const HOUR = DAY + 11 * HOUR_MS;
@@ -120,6 +132,76 @@ async function fillHour(): Promise<void> {
   }
 }
 
+/**
+ * The merge as a process, not as a function.
+ *
+ * Everything else here calls `compactHour` in-process, and the scheduler's own
+ * tests answer with a stub. Between them sits a contract nothing was checking:
+ * the argv `runCompaction` builds, the JSON `main.ts` prints, and the fields
+ * `summariseCompaction` reads back out of it. The roll has exactly this
+ * coverage; the merge had none.
+ */
+describe("the real merge process, driven by the scheduler", () => {
+  it("merges the hour and reports what it wrote", async () => {
+    await fillHour();
+    const logged: string[] = [];
+    const errors: string[] = [];
+    const rolls = new RollScheduler({
+      store,
+      dataDir: dir,
+      intervalMinutes: 5,
+      now: () => HOUR + HOUR_MS + 60_000,
+      log: (line) => logged.push(line),
+      onError: (line) => errors.push(line),
+    });
+
+    // Nothing left to roll, so no roll child: this drives the merge alone,
+    // through `COMPACT_ENTRY` and the default spawn.
+    await rolls.rollOnce(HOUR + HOUR_MS);
+
+    assert.deepEqual(errors, []);
+    assert.equal(existsSync(compactedFile(dir, HOUR, HOUR)), true);
+    assert.match(
+      logged.join("\n"),
+      new RegExp(
+        `compacted the hour starting ${HOUR}: 1 file\\(s\\), 240 rows, \\d+ -> \\d+ bytes`,
+      ),
+    );
+  });
+
+  it("refuses to run beside a live roll", async () => {
+    await fillHour();
+    // The claim a roll holds, taken here so the merge meets it.
+    const claim = await claimTheDataDirectory(writerPaths(dir).rollSocket);
+    assert.notEqual(claim, null);
+    try {
+      const attempt = spawnSync(
+        process.execPath,
+        [COMPACT_ENTRY, "--data-dir", dir, "--hour", String(HOUR)],
+        { encoding: "utf8", timeout: 60_000 },
+      );
+      assert.equal(attempt.status, EXIT_LOCKED);
+      assert.match(
+        attempt.stderr,
+        /already running against this data directory/,
+      );
+    } finally {
+      claim?.close();
+    }
+    assert.equal(existsSync(compactedFile(dir, HOUR, HOUR)), false);
+  });
+
+  it("says so rather than reporting success when the tree is not there", () => {
+    const attempt = spawnSync(
+      process.execPath,
+      [COMPACT_ENTRY, "--data-dir", join(dir, "nope"), "--hour", String(HOUR)],
+      { encoding: "utf8", timeout: 60_000 },
+    );
+    assert.equal(attempt.status, 1);
+    assert.match(attempt.stderr, /there is no tree here/);
+  });
+});
+
 describe("compactHour", () => {
   it("answers a range exactly as the rolls it replaced did", async () => {
     await fillHour();
@@ -167,15 +249,11 @@ describe("compactHour", () => {
     const before = await read(request);
 
     // A merge that got as far as the rename and no further.
-    const units = (await import("../compact/plan.js")).planCompaction(
-      dir,
-      HOUR,
-    );
+    const units = planCompaction(dir, HOUR);
     assert.equal(units.length, 1);
     await compactHour({ dataDir: dir, hourStartMs: HOUR });
     // Put the inputs back, which is the state a killed merge leaves.
     for (const input of units[0].inputs) {
-      const { copyFileSync } = await import("node:fs");
       copyFileSync(compactedFile(dir, HOUR, HOUR), input);
     }
 
@@ -253,10 +331,94 @@ describe("compactHour", () => {
     const again = await compactHour({ dataDir: dir, hourStartMs: HOUR });
     assert.deepEqual(again.files, []);
     assert.deepEqual(again.alreadyCompacted, [compactedFile(dir, HOUR, HOUR)]);
+    assert.deepEqual(again.orphanInputs, []);
+    assert.deepEqual(again.quarantined, []);
     assert.deepEqual(readdirSync(dateDirectory(dir, HOUR)), [
       `hour-${HOUR}.parquet`,
     ]);
     assert.deepEqual(await read(request), before);
+  });
+
+  /**
+   * **An existing output is a claim, not a fact.** Every leftover beside it is
+   * a file whose rows the hot store truncated when it landed, so removing one
+   * deletes the only copy. `commitFile` fsyncs before it renames, so a short
+   * output means the storage lost bytes it acknowledged -- which
+   * `writeSidecar` already handles, and names, for the same media.
+   */
+  it("merges the hour again when the existing output cannot be read", async () => {
+    await fillHour();
+    const request: QueryRequest = {
+      kind: "range",
+      from: HOUR,
+      to: HOUR + HOUR_MS,
+      context: "self",
+    };
+    const before = await read(request);
+    assert.equal(before.length, 240);
+
+    // The rename landed and the bytes did not.
+    writeFileSync(compactedFile(dir, HOUR, HOUR), "");
+
+    const result = await compactHour({ dataDir: dir, hourStartMs: HOUR });
+    assert.deepEqual(result.quarantined, [compactedFile(dir, HOUR, HOUR)]);
+    assert.equal(result.files.length, 1);
+    assert.equal(result.files[0].rows, 240);
+    assert.deepEqual(await read(request), before);
+    assert.equal(
+      existsSync(`${compactedFile(dir, HOUR, HOUR)}.unreadable`),
+      true,
+    );
+  });
+
+  /**
+   * A roll that landed inside an already-merged hour is invisible to every
+   * query, which is bad and recoverable: the file is still on disk. Deleting it
+   * because a merged file happens to exist is what turns it into a loss, and
+   * the deletion is what an operator reaches for to clean up.
+   */
+  it("leaves a roll the merged hour does not hold", async () => {
+    await fillHour();
+    await compactHour({ dataDir: dir, hourStartMs: HOUR });
+    // A roll file inside the merged hour, holding rows the merge never saw.
+    // Built by rolling into the *next* hour and renaming, because a roll can
+    // no longer arrive here on its own -- `refuseMergedHour` refuses the id.
+    // This is the state a build before that refusal leaves behind, and the one
+    // an operator reaches for the merge to clean up.
+    const late = HOUR + HOUR_MS + 300_000;
+    await rollSlice(HOUR + HOUR_MS + 60_000, 20, late);
+    const directory = dateDirectory(dir, HOUR);
+    const inside = join(directory, `${HOUR + 45 * 60_000}.parquet`);
+    copyFileSync(join(directory, `${late}.parquet`), inside);
+    rmSync(join(directory, `${late}.parquet`));
+
+    const result = await compactHour({ dataDir: dir, hourStartMs: HOUR });
+    assert.deepEqual(result.alreadyCompacted, []);
+    assert.deepEqual(result.orphanInputs, [inside]);
+    assert.deepEqual(result.strayInputs, []);
+    assert.equal(existsSync(inside), true);
+  });
+
+  /**
+   * The window is what makes the sweep safe: it must collect what a killed
+   * merge abandoned and never what a live one is still writing. Both directions
+   * are asserted, because inverting the comparison passes a test that only
+   * checks the old file is gone.
+   */
+  it("collects an abandoned temporary and leaves a fresh one", async () => {
+    await fillHour();
+    const directory = dateDirectory(dir, HOUR);
+    const old = join(directory, "hour-1.parquet.999.tmp");
+    const fresh = join(directory, "hour-2.parquet.998.tmp");
+    writeFileSync(old, "");
+    writeFileSync(fresh, "");
+    const ago = (Date.now() - 7 * 60 * 60_000) / 1000;
+    utimesSync(old, ago, ago);
+
+    await compactHour({ dataDir: dir, hourStartMs: HOUR });
+
+    assert.equal(existsSync(old), false);
+    assert.equal(existsSync(fresh), true);
   });
 
   it("refuses an hour that does not start on the hour", async () => {
@@ -314,6 +476,28 @@ describe("compactHour", () => {
     assert.equal(readdirSync(dateDirectory(dir, HOUR)).length, 12);
   });
 
+  /**
+   * `written` means the rows are in the tree and still in the hot store, and
+   * `rolledOverlap` resolves that seam by looking for `<rollId>.parquet` among
+   * the live files. A merge renames it away, `liveTreeFiles` then hides it, and
+   * every row of that roll is answered twice.
+   */
+  it("refuses while a roll of that hour is written but not truncated", async () => {
+    await fillHour();
+    writeFileSync(
+      writerPaths(dir).pendingRoll,
+      `${JSON.stringify({
+        rollId: HOUR + 600_000,
+        maxRowid: 1,
+        phase: "written",
+      })}\n`,
+    );
+    await assert.rejects(
+      () => compactHour({ dataDir: dir, hourStartMs: HOUR }),
+      /is unfinished/,
+    );
+  });
+
   it("merges past a pending roll that belongs to another hour", async () => {
     await fillHour();
     writeFileSync(
@@ -328,12 +512,7 @@ describe("compactHour", () => {
     assert.equal(result.files.length, 1);
   });
 
-  /**
-   * A `.tmp` in a date directory is collected by the next roll that writes
-   * there — except for the unit of a midnight-spanning hour, which lands in
-   * the day before, a directory no later roll touches.
-   */
-  it("leaves no temporary behind when the merge fails", async () => {
+  it("unlinks nothing when an input cannot be read", async () => {
     await fillHour();
     const directory = dateDirectory(dir, HOUR);
     const corrupt = readdirSync(directory)[0];
@@ -342,12 +521,8 @@ describe("compactHour", () => {
     await assert.rejects(() =>
       compactHour({ dataDir: dir, hourStartMs: HOUR }),
     );
-    assert.deepEqual(
-      readdirSync(directory).filter((name) => name.endsWith(".tmp")),
-      [],
-    );
-    // And the inputs are all still there: nothing is unlinked before a merge
-    // has landed.
+    // Nothing is unlinked before a merge has landed, and the COPY failed while
+    // binding `read_parquet` -- so it never created a temp either.
     assert.equal(readdirSync(directory).length, 12);
   });
 });

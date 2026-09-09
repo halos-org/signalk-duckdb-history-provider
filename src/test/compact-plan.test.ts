@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { HOUR_MS, coversHour, planCompaction } from "../compact/plan.js";
+import { planCompaction } from "../compact/plan.js";
+import { HOUR_MS, coversHour } from "../roll/tree-path.js";
 import { DATA_LAYOUT } from "../data-dir.js";
 
 /**
@@ -162,18 +163,6 @@ describe("planCompaction", () => {
   it("is empty for a merged hour with nothing left beside it", () => {
     tree("2026-09-02", `hour-${HOUR}.parquet`);
     assert.deepEqual(planCompaction(dir, HOUR), []);
-  });
-
-  it("gives two merges of one hour different temp files", () => {
-    tree(
-      "2026-09-02",
-      `${HOUR + 300_000}.parquet`,
-      `${HOUR + 600_000}.parquet`,
-    );
-    assert.notEqual(
-      planCompaction(dir, HOUR, 11)[0].temp,
-      planCompaction(dir, HOUR, 12)[0].temp,
-    );
   });
 
   it("ignores a half-written temp file and anything not a roll", () => {
