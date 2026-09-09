@@ -122,10 +122,19 @@ async function main(): Promise<void> {
   // only when an operator turned compaction off, so a writer started by an
   // older plugin compacts, which is the default.
   const compactHourly = !process.argv.includes("--no-compact");
+  // What will happen, not what was passed. An hour holds at most one roll at
+  // an interval of 60 minutes or more, so the scheduler merges nothing there
+  // whatever the flag says -- and a line reporting the flag would tell exactly
+  // the devices that get no merge that they are being merged.
+  const compaction = !compactHourly
+    ? "not compacting: turned off"
+    : rollIntervalMinutes >= 60
+      ? `not compacting: a ${rollIntervalMinutes}-minute roll already fills an hour`
+      : "compacting each completed hour";
   process.stdout.write(
     `writer ready on ${paths.socket}, rolling every ${rollIntervalMinutes} minutes, ` +
       `keeping ${retentionUsable === 0 ? "everything" : `${retentionUsable} days`}, ` +
-      `${compactHourly ? "compacting" : "not compacting"} each completed hour\n`,
+      `${compaction}\n`,
   );
 
   // The roll runs here rather than in the plugin because only this process may

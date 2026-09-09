@@ -25,6 +25,48 @@ const complete: Config = {
   compactHourly: false,
 };
 
+/**
+ * The two defaults compaction turns on, asserted as literals rather than
+ * through `CONFIG_DEFAULTS`.
+ *
+ * Every other test compares the schema against that object, so both move
+ * together and neither is pinned. The interval matters twice over: at 60
+ * minutes or more `compactClosedHour` returns before spawning anything, so
+ * reverting it silently turns the whole feature off while the Admin UI still
+ * shows it on.
+ */
+describe("the defaults hourly compaction depends on", () => {
+  it("rolls every five minutes, which is what makes a merge worth doing", () => {
+    assert.equal(CONFIG_DEFAULTS.rollIntervalMinutes, 5);
+    assert.equal(
+      (
+        ConfigSchema.properties.rollIntervalMinutes as unknown as {
+          default: number;
+        }
+      ).default,
+      5,
+    );
+  });
+
+  it("compacts by default", () => {
+    assert.equal(CONFIG_DEFAULTS.compactHourly, true);
+    assert.equal(
+      (ConfigSchema.properties.compactHourly as unknown as { default: boolean })
+        .default,
+      true,
+    );
+  });
+
+  /** The upgrade path for every install that predates the option. */
+  it("treats an absent compactHourly as on", () => {
+    assert.equal(normalizeConfig({}).compactHourly, true);
+    assert.equal(
+      normalizeConfig({ compactHourly: false }).compactHourly,
+      false,
+    );
+  });
+});
+
 describe("ConfigSchema", () => {
   it("renders every option the plugin is configured with", () => {
     // The Admin UI form IS this schema, so a missing property is a missing

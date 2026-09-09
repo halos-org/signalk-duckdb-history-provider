@@ -17,7 +17,7 @@ import { DATA_LAYOUT } from "../data-dir.js";
 import { dateDirectory } from "../roll/tree-path.js";
 import { writerPaths } from "../writer/contract.js";
 import { HotStore } from "../writer/hot-store.js";
-import { RollScheduler } from "../writer/roll-scheduler.js";
+import { RollScheduler, compactBudgetMs } from "../writer/roll-scheduler.js";
 import { NO_BUNDLED_EXTENSION, eventually, sample } from "./fixtures.js";
 import type { Sample } from "../writer/protocol.js";
 
@@ -792,21 +792,6 @@ describe("compaction, scheduled", () => {
     assert.deepEqual(compactions, []);
   });
 
-  /**
-   * Twelve rolls an hour would otherwise be twelve spawns of a process whose
-   * first act is to map the engine's ~100 MB addon, eleven of them to find an
-   * hour already merged.
-   */
-  it("merges each closed hour once, not each roll", async () => {
-    const rolls = scheduler(FIVE);
-    for (const slot of [SLOT, SLOT + 300_000, SLOT + 600_000]) {
-      record(sample({ ts: AUG_23 }));
-      await rolls.rollOnce(slot);
-    }
-
-    assert.deepEqual(hoursMerged(), [SLOT - 3_600_000]);
-  });
-
   it("moves on to the next hour once a roll closes one", async () => {
     const rolls = scheduler(FIVE);
     for (const slot of [SLOT, SLOT + 3_600_000]) {
@@ -849,6 +834,18 @@ describe("compaction, scheduled", () => {
    * it — so the spawn maps the engine once an hour to do nothing. This is the
    * upgrade path for every install that has not changed the interval.
    */
+  /**
+   * `arm()` re-reads the clock after `rollOnce` settles, so a merge allowed a
+   * whole interval costs a roll rather than delaying one. Asserted against the
+   * arithmetic rather than by waiting one out: the ceiling is five minutes.
+   */
+  it("gives a merge half a roll interval, capped at five minutes", () => {
+    assert.equal(compactBudgetMs(1), 30_000);
+    assert.equal(compactBudgetMs(5), 150_000);
+    assert.equal(compactBudgetMs(45), 300_000);
+    assert.equal(compactBudgetMs(720), 300_000);
+  });
+
   it("does not spawn a merge at an interval that cannot fill an hour", async () => {
     record(sample({ ts: AUG_23 }));
     await scheduler({ intervalMinutes: 60 }).rollOnce(SLOT);
@@ -890,12 +887,77 @@ describe("compaction, scheduled", () => {
     assert.match(errors.join("\n"), /could not remove 2 of the roll files/);
   });
 
+  /**
+   * Every reachable merge failure is a transient: a spawn that could not get
+   * memory, the SIGKILL at the timeout, an EIO on a failing card. Recording the
+   * hour as done before awaiting the child meant any one of them cost that hour
+   * for the life of the writer, and there is no catch-up pass anywhere.
+   */
+  it("offers a failed hour again at the next roll", async () => {
+    let attempts = 0;
+    const rolls = scheduler({
+      ...FIVE,
+      spawnCompact: (args) => {
+        attempts += 1;
+        if (attempts > 1) return merges()(args);
+        compactions.push(args);
+        return FAILS();
+      },
+    });
+    for (const slot of [SLOT, SLOT + 300_000]) {
+      record(sample({ ts: AUG_23 }));
+      await rolls.rollOnce(slot);
+    }
+
+    assert.deepEqual(hoursMerged(), [SLOT - 3_600_000, SLOT - 3_600_000]);
+    assert.match(errors.join("\n"), /did not finish/);
+    assert.match(logged.join("\n"), /compacted the hour starting/);
+  });
+
+  it("stops offering an hour once a merge of it has succeeded", async () => {
+    const rolls = scheduler(FIVE);
+    for (const slot of [SLOT, SLOT + 300_000, SLOT + 600_000]) {
+      record(sample({ ts: AUG_23 }));
+      await rolls.rollOnce(slot);
+    }
+
+    assert.deepEqual(hoursMerged(), [SLOT - 3_600_000]);
+  });
+
+  /**
+   * A merge killed after `commitFile` has already renamed one unit into place,
+   * and from that instant `liveTreeFiles` stops returning the rolls it
+   * superseded. Telling the operator they are untouched points them away from
+   * the only thing that finishes the job.
+   */
+  it("does not claim the rolls are untouched when a merge fails", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({ ...FIVE, spawnCompact: FAILS }).rollOnce(SLOT);
+
+    const line = errors.join("\n");
+    assert.doesNotMatch(line, /untouched/);
+    assert.match(line, /compact\/main\.js --hour \d+/);
+  });
+
+  it("reports a quarantined output and orphaned rolls on the error sink", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({
+      ...FIVE,
+      spawnCompact: merges({
+        quarantined: ["hour-x.parquet"],
+        orphanInputs: ["a.parquet", "b.parquet"],
+      }),
+    }).rollOnce(SLOT);
+
+    assert.match(errors.join("\n"), /could not be read/);
+    assert.match(errors.join("\n"), /2 roll file\(s\).*hold rows the merged/s);
+  });
+
   it("reports a merge that fails, and keeps the roll's own success", async () => {
     record(sample({ ts: AUG_23 }));
     await scheduler({ ...FIVE, spawnCompact: FAILS }).rollOnce(SLOT);
 
     assert.match(errors.join("\n"), /did not finish/);
-    assert.match(errors.join("\n"), /still answer every query/);
     assert.match(logged.join("\n"), /1 rows truncated/);
     assert.equal(store.rowCount(), 0);
   });
@@ -908,6 +970,47 @@ describe("compaction, scheduled", () => {
     }).rollOnce(SLOT);
 
     assert.match(errors.join("\n"), /signal SIGKILL/);
+  });
+
+  /**
+   * `runCompaction` is the only bound on a wedged merge, and a merge holds
+   * `this.running`, which is what `rollOnce` checks before starting anything.
+   * So a merge that never exits does cost recording, however much the comment
+   * above it says nothing waits on it.
+   */
+  it("kills a merge that overruns its budget", async () => {
+    // Nothing recorded, so no roll child: `timeoutMs` is one knob for both,
+    // and a roll racing a 50 ms budget is the thing that times out instead.
+    await scheduler({ ...FIVE, spawnCompact: HANGS, timeoutMs: 50 }).rollOnce(
+      SLOT,
+    );
+
+    assert.match(errors.join("\n"), /ran past 50 ms/);
+    assert.match(errors.join("\n"), /did not finish/);
+  });
+
+  it("kills a merge in flight when the writer stops", async () => {
+    let child: ChildProcess | null = null;
+    const rolls = scheduler({
+      ...FIVE,
+      spawnCompact: () => {
+        child = HANGS();
+        return child;
+      },
+      timeoutMs: 60_000,
+    });
+    const rolling = rolls.rollOnce(SLOT);
+    await eventually(() => child !== null, "the merge to be spawned");
+    await rolls.stop();
+    await rolling;
+
+    assert.notEqual(child, null);
+    await eventually(
+      () =>
+        (child as unknown as ChildProcess).exitCode !== null ||
+        (child as unknown as ChildProcess).signalCode !== null,
+      "the merge to be killed",
+    );
   });
 
   /**

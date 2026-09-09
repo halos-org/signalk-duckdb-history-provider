@@ -151,15 +151,34 @@ describe("a delta reaching the writer's store", () => {
    * leave alone — with nothing failing anywhere. The writer reports back what
    * it was actually given, which is the only place the two spellings meet.
    */
-  for (const compactHourly of [true, false]) {
-    it(`hands the writer its interval, its retention and compaction ${compactHourly ? "on" : "off"}`, async () => {
+  for (const { compactHourly, interval, expected } of [
+    {
+      compactHourly: true,
+      interval: 30,
+      expected: "compacting each completed hour",
+    },
+    {
+      compactHourly: false,
+      interval: 30,
+      expected: "not compacting: turned off",
+    },
+    // The flag is on and the merge still cannot run: an hour holds one roll at
+    // this interval. Reporting the flag here would tell exactly the devices
+    // that get no merge that they are being merged.
+    {
+      compactHourly: true,
+      interval: 60,
+      expected: "not compacting: a 60-minute roll already fills an hour",
+    },
+  ]) {
+    it(`reports the writer's effective compaction at ${interval} minutes with the flag ${compactHourly ? "on" : "off"}`, async () => {
       const base = mkdtempSync(join(tmpdir(), "sk-parquet-e2e-"));
       const paths = writerPaths(base);
       const { app, calls } = stubApp(base);
       const plugin = createPlugin(app);
       try {
         plugin.start({
-          rollIntervalMinutes: 30,
+          rollIntervalMinutes: interval,
           retentionDays: 14,
           compactHourly,
         });
@@ -171,8 +190,8 @@ describe("a delta reaching the writer's store", () => {
         assert.match(
           calls.debug.join("\n"),
           new RegExp(
-            `rolling every 30 minutes, keeping 14 days, ` +
-              `${compactHourly ? "compacting" : "not compacting"} each completed hour`,
+            `rolling every ${interval} minutes, keeping 14 days, ` +
+              expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
           ),
         );
       } finally {

@@ -101,7 +101,7 @@ export const ConfigSchema = Type.Object({
     default: true,
     title: "Compact each completed hour",
     description:
-      "Merge an hour's roll files into one file sorted by path, once the hour is complete. Costs a short-lived process an hour and gives back both storage and query time; turn it off to leave the tree exactly as the rolls wrote it.",
+      "Merge an hour's roll files into one file sorted by path, once the hour is complete. Costs a short-lived process an hour and gives back both storage and query time. It does nothing at a roll interval of 60 minutes or more, where an hour already holds one file. Turning it off stops future merges and does not undo past ones.",
   }),
 });
 
