@@ -1,13 +1,11 @@
-import { createServer } from "node:net";
-import type { Server } from "node:net";
-import { chmodSync, rmSync, writeSync } from "node:fs";
+import { writeSync } from "node:fs";
 import { ownPeakBytes } from "../bench/one-shot.js";
+import { claimTheDataDirectory } from "../writer/claim.js";
 import {
   EXIT_LOCKED,
   EXIT_NAME_TAKEN,
   writerPaths,
 } from "../writer/contract.js";
-import { probeLiveWriter } from "../writer/server.js";
 import { NameTakenError, roll } from "./roll.js";
 
 /**
@@ -50,47 +48,6 @@ import { NameTakenError, roll } from "./roll.js";
  */
 function writeStderr(line: string): void {
   writeSync(2, line);
-}
-
-/**
- * Take the claim on the data directory, or report that another roll holds it.
- *
- * **Bind first, ask questions second.** The bind is the atomic step: two rolls
- * racing cannot both succeed at it, and the loser gets EADDRINUSE. Probing
- * first and then unlinking — which is what `writer/server.ts` does, and can
- * afford to, because the plugin starts exactly one writer and Signal K
- * serialises starts — would let both processes see nothing listening, both
- * unlink, and both bind. That is precisely the case this claim exists for: an
- * orphan roll left by a killed writer, and the successor that follows it.
- *
- * The unlink only ever removes a socket nothing answers on. The residual race
- * is two rolls finding the *same* stale socket in the same instant; the
- * scheduler runs one roll at a time within a writer, and across writers the
- * predecessor's socket is either live — handled here — or its process is gone.
- */
-async function claimTheDataDirectory(
-  socketPath: string,
-): Promise<Server | null> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const server = createServer();
-    try {
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(socketPath, () => resolve());
-      });
-      chmodSync(socketPath, 0o600);
-      // Never hold the process open: the roll's own work decides when it ends.
-      server.unref();
-      return server;
-    } catch (err) {
-      server.close();
-      if ((err as NodeJS.ErrnoException).code !== "EADDRINUSE") throw err;
-      // Something is at that path. Only a live roll may keep it.
-      if (await probeLiveWriter(socketPath)) return null;
-      rmSync(socketPath, { force: true });
-    }
-  }
-  return null;
 }
 
 function argValue(flag: string): string | undefined {
