@@ -317,17 +317,21 @@ Three properties make it safe to run over the only copy of the data:
   particular moment. `liveTreeFiles` stops returning a roll the instant a
   compacted file covering its id exists, so the window where both are on disk
   answers each row once.
-- **An hour is merged once.** `planCompaction` reports an hour whose output
-  already exists as already merged, and the only thing done to it is the
-  removal of inputs an interrupted run did not get to. Re-merging survivors
-  would rename a fraction of the hour over the whole of it.
+- **A readable merged hour is not merged again.** `planCompaction` reports an
+  hour whose output already exists as already merged. `compactHour` then reads
+  that output back: if it holds the leftover inputs, the only thing done is
+  the removal of those inputs an interrupted run did not get to, because
+  re-merging survivors would rename a fraction of the hour over the whole of
+  it. An output that cannot be read is renamed aside as `.unreadable` and the
+  hour is merged again from the inputs still on disk.
 - **A roll never lands inside a merged hour.** Suppression is by id range, so
   such a roll would be on disk and invisible to every query. `roll.ts` refuses
   the id outright and the rows stay in the hot store, which is this package's
   preferred failure.
 
-Turning it off leaves the tree exactly as the rolls wrote it: `compactHourly`
-in the plugin config, `--no-compact` on the writer.
+Turning it off stops future merges and undoes none: hours already merged keep
+their `hour-<ms>.parquet`, and later hours stay as the rolls wrote them. The
+switch is `compactHourly` in the plugin config, `--no-compact` on the writer.
 
 ## The sidecar: yes
 
