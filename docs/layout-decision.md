@@ -12,10 +12,15 @@ one after data exists means re-rolling the tree.
 1. **No path partitioning.** One Parquet file per roll, holding every context
    and every path, with `context` and `path` as columns. The directory tree
    carries time only: `<data-dir>/parquet/date=<YYYY-MM-DD>/<rollStart>.parquet`.
-2. **Hourly rolls by default**, aligned to the UTC hour, and configurable. What
-   the interval really has to hold is the hot store's ceiling near 50 MB; an
-   hour does that at the rate measured here and not at ten times it.
-3. **No compaction pass.** The roll's output is the final form of the file.
+2. **Five-minute rolls by default**, aligned to UTC midnight, and
+   configurable. What the interval really has to hold is the hot store's
+   ceiling near 50 MB. An hour does that at the rate measured here and not at
+   ten times it, and the shorter interval holds it at both — see _Compaction:
+   yes, hourly_ below for why the file count it produces is no longer the
+   objection it was.
+3. **An hourly compaction pass**, merging each completed hour's rolls into one
+   file sorted by path. Superseded decision 3 below, which was "no compaction
+   pass"; the reasoning that changed it is in _Compaction: yes, hourly_.
 4. **A cumulative last-value sidecar per roll**, one row per
    `(context, path)`.
 
@@ -233,7 +238,12 @@ day. Nothing in the flat layout objects to that — the roll cost at 38,970 rows
 is 109 MB and 1.0 s — but it is the roll interval, not the layout, that has to
 move, and the default of one hour is right for a rate near the one measured.
 
-## Compaction: no
+## Compaction: no, daily
+
+**Superseded — see _Compaction: yes, hourly_ below.** This section priced a
+_daily_ pass and rejected it, and the rejection still holds for that shape. The
+hourly pass that ships is a different unit with a different peak, and it exists
+because a later decision made the roll interval twelve times shorter.
 
 Compaction would merge a day of roll files into one file per partition. Its only
 real gain is that a merged file can be sorted by path, which gives row-group
@@ -253,7 +263,7 @@ mode. A day at the real rate is 11M rows, not 1.27M, so that peak is a floor.
 Compaction without the sort is cheaper — 344.4–369.4 MB, 704 ms — and buys
 almost nothing: 140 ms against 150 ms, 3.18 MiB against 3.51 MiB.
 
-So: no compaction pass, and no second unit for one.
+So: no daily compaction pass, and no second unit for one.
 
 **What would reopen it.** If Unit 4a's real reader shows a multi-day query
 dominated by per-file cost rather than by startup. The aged-tree row for 720
@@ -261,6 +271,50 @@ flat files — 931–1,169 ms and 75.5 MB read for one path over thirty days —
 the warning sign to watch. If that shape turns out to be common, the answer is
 group partitioning plus daily compaction (559 ms, 19.1 MB), and it has to be
 decided before a year of tree exists.
+
+## Compaction: yes, hourly
+
+**What reopened it was not the query — it was the roll interval.** The default
+moved from 60 minutes to 5, because the hot store's ceiling is what the
+interval has to hold and 5 minutes holds it at rates an hour does not. That
+turns 24 files a day into 288, and 720 files for thirty days into 8,640 — well
+past the file count the section above named as the warning sign.
+
+The pass that ships merges **one completed hour**, not a day, and it is the
+sort that pays rather than the file count:
+
+|                                         |                  |
+| --------------------------------------- | ---------------- |
+| twelve 5-minute rolls, one hour         | 936,216 B        |
+| one hourly file, sorted by `path`, zstd | 343,746 B        |
+| bytes per row, inputs                   | 4.94             |
+| bytes per row, unsorted hourly roll     | 3.17             |
+| bytes per row, merged and sorted        | 1.81             |
+| single-path range over a day's files    | 42.2 ms → 3.4 ms |
+
+The transient is 190k rows at a 202 MB peak — the order the roll beside it
+already costs, and less than half the 466.5–484.6 MB the daily pass needed.
+That is the whole difference: a day is 1.27M–11M rows and cannot be merged
+inside this device's budget; an hour can.
+
+Three properties make it safe to run over the only copy of the data:
+
+- **A reader never sees an hour twice.** The merge renames its output into
+  place — atomic for one file — and unlinks its inputs afterwards, at no
+  particular moment. `liveTreeFiles` stops returning a roll the instant a
+  compacted file covering its id exists, so the window where both are on disk
+  answers each row once.
+- **An hour is merged once.** `planCompaction` reports an hour whose output
+  already exists as already merged, and the only thing done to it is the
+  removal of inputs an interrupted run did not get to. Re-merging survivors
+  would rename a fraction of the hour over the whole of it.
+- **A roll never lands inside a merged hour.** Suppression is by id range, so
+  such a roll would be on disk and invisible to every query. `roll.ts` refuses
+  the id outright and the rows stay in the hot store, which is this package's
+  preferred failure.
+
+Turning it off leaves the tree exactly as the rolls wrote it: `compactHourly`
+in the plugin config, `--no-compact` on the writer.
 
 ## The sidecar: yes
 
