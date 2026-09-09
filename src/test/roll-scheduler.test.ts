@@ -41,6 +41,7 @@ beforeEach(() => {
   seq = 0;
   logged = [];
   errors = [];
+  compactions = [];
 });
 
 afterEach(() => {
@@ -106,6 +107,36 @@ function summarising(
   return child(`console.log(${JSON.stringify(JSON.stringify(summary))})`);
 }
 
+let compactions: string[][];
+
+/**
+ * A stand-in merge that reports what a real one would.
+ *
+ * The default in `scheduler()` below, because `SLOT` is a UTC hour boundary:
+ * without it every roll test in this file spawns the real
+ * `dist/compact/main.js` against a temp directory, which is both slow and a
+ * merge nobody asked for.
+ */
+function merges(
+  extra: Record<string, unknown> = {},
+): (args: string[]) => ChildProcess {
+  return (args) => {
+    compactions.push(args);
+    const summary = {
+      hourStartMs: Number(argOf(args, "--hour")),
+      files: [{ path: "x", rows: 240, bytesIn: 936_216, bytesOut: 343_746 }],
+      alreadyCompacted: [],
+      strayInputs: [],
+      peakRssBytes: null,
+      ...extra,
+    };
+    return child(`console.log(${JSON.stringify(JSON.stringify(summary))})`);
+  };
+}
+
+const hoursMerged = (): number[] =>
+  compactions.map((args) => Number(argOf(args, "--hour")));
+
 const FAILS = (): ChildProcess =>
   child(
     `console.error("boom: the roll could not finish\\n    at some.frame"); process.exit(3)`,
@@ -130,6 +161,7 @@ function scheduler(
     onError: (line) => errors.push(line),
     now: () => NOW,
     spawnRoll: succeeds(),
+    spawnCompact: merges(),
     ...over,
   });
 }
@@ -732,3 +764,169 @@ describe(
     });
   },
 );
+
+/**
+ * The merge, from the side that decides when it runs.
+ *
+ * Every test here drives it through `spawnCompact`, which exists for exactly
+ * this and which nothing used. The point is not that the merge works — that is
+ * `compact.test.ts` — but that the scheduler reaches it at all, reaches it once
+ * per hour, does not reach it when an operator turned it off, and reports what
+ * it says.
+ */
+describe("compaction, scheduled", () => {
+  const FIVE = { intervalMinutes: 5 };
+
+  it("merges the hour a roll closed", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler(FIVE).rollOnce(SLOT);
+
+    assert.deepEqual(hoursMerged(), [SLOT - 3_600_000]);
+    assert.match(logged.join("\n"), /compacted the hour starting/);
+  });
+
+  it("merges nothing when an operator turned it off", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({ ...FIVE, compactHourly: false }).rollOnce(SLOT);
+
+    assert.deepEqual(compactions, []);
+  });
+
+  /**
+   * Twelve rolls an hour would otherwise be twelve spawns of a process whose
+   * first act is to map the engine's ~100 MB addon, eleven of them to find an
+   * hour already merged.
+   */
+  it("merges each closed hour once, not each roll", async () => {
+    const rolls = scheduler(FIVE);
+    for (const slot of [SLOT, SLOT + 300_000, SLOT + 600_000]) {
+      record(sample({ ts: AUG_23 }));
+      await rolls.rollOnce(slot);
+    }
+
+    assert.deepEqual(hoursMerged(), [SLOT - 3_600_000]);
+  });
+
+  it("moves on to the next hour once a roll closes one", async () => {
+    const rolls = scheduler(FIVE);
+    for (const slot of [SLOT, SLOT + 3_600_000]) {
+      record(sample({ ts: AUG_23 }));
+      await rolls.rollOnce(slot);
+    }
+
+    assert.deepEqual(hoursMerged(), [SLOT - 3_600_000, SLOT]);
+  });
+
+  /**
+   * The trigger used to be `slot % HOUR_MS === 0`, which fires only on rolls
+   * landing exactly on the hour. Ten of the intervals that divide 1440 do not
+   * divide 60, and at those it compacted a fraction of the hours and left the
+   * rest for ever — with the UI still reporting compaction as on.
+   */
+  it("merges at an interval that divides the day but not the hour", async () => {
+    const rolls = scheduler({ intervalMinutes: 45 });
+    record(sample({ ts: AUG_23 }));
+    // 15:45, which closes no hour boundary and is not a multiple of one.
+    await rolls.rollOnce(SLOT + 45 * 60_000);
+
+    assert.deepEqual(hoursMerged(), [SLOT - 3_600_000]);
+  });
+
+  /**
+   * An interval with nothing recorded in it is ordinary at the shipped
+   * default, and hanging the merge off the tail of a successful roll alone
+   * left those hours uncompacted for ever: there is no catch-up pass.
+   */
+  it("merges even when the interval had nothing to roll", async () => {
+    await scheduler(FIVE).rollOnce(SLOT);
+
+    assert.equal(store.rowCount(), 0);
+    assert.deepEqual(hoursMerged(), [SLOT - 3_600_000]);
+  });
+
+  /**
+   * At an hour or more, an hour holds at most one roll and the planner skips
+   * it — so the spawn maps the engine once an hour to do nothing. This is the
+   * upgrade path for every install that has not changed the interval.
+   */
+  it("does not spawn a merge at an interval that cannot fill an hour", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({ intervalMinutes: 60 }).rollOnce(SLOT);
+
+    assert.deepEqual(compactions, []);
+  });
+
+  /**
+   * A roll that failed leaves a `rolling` record, and its rows are neither in
+   * the tree nor out of the store. Merging the hour it belongs to would rename
+   * away the file `rolledOverlap` looks for by name.
+   *
+   * The rule itself is `compactHour`'s, which reads the record from disk --
+   * `compact.test.ts` drives it there. This checks the cheaper property the
+   * scheduler owns: a roll that did not finish does not reach a merge at all.
+   */
+  it("does not merge after a roll that failed", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({ ...FIVE, spawnRoll: FAILS }).rollOnce(SLOT);
+
+    assert.deepEqual(compactions, []);
+    assert.equal(pendingFile()?.phase, "rolling");
+    assert.equal(store.rowCount(), 1);
+  });
+
+  /**
+   * These files are the state a half-finished merge leaves: ignored by every
+   * query, counted by no retention, and never revisited, because each hour is
+   * merged once. The error sink is where an operator sees them; the success
+   * line is debug-level.
+   */
+  it("reports inputs the merge could not remove on the error sink", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({
+      ...FIVE,
+      spawnCompact: merges({ strayInputs: ["a.parquet", "b.parquet"] }),
+    }).rollOnce(SLOT);
+
+    assert.match(errors.join("\n"), /could not remove 2 of the roll files/);
+  });
+
+  it("reports a merge that fails, and keeps the roll's own success", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({ ...FIVE, spawnCompact: FAILS }).rollOnce(SLOT);
+
+    assert.match(errors.join("\n"), /did not finish/);
+    assert.match(errors.join("\n"), /still answer every query/);
+    assert.match(logged.join("\n"), /1 rows truncated/);
+    assert.equal(store.rowCount(), 0);
+  });
+
+  it("names the signal when a merge is killed", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({
+      ...FIVE,
+      spawnCompact: () => child(`process.kill(process.pid, "SIGKILL")`),
+    }).rollOnce(SLOT);
+
+    assert.match(errors.join("\n"), /signal SIGKILL/);
+  });
+
+  /**
+   * `COMPACT_ENTRY` is resolved from `import.meta.url` at load time, so a
+   * build that moved or dropped the merge's entry point would fail at the
+   * first hour rather than at compile.
+   */
+  it("points at a merge entry point that exists", async () => {
+    let entry = "";
+    record(sample({ ts: AUG_23 }));
+    await scheduler({
+      ...FIVE,
+      spawnCompact: (args) => {
+        entry = args[0];
+        return merges()(args);
+      },
+    }).rollOnce(SLOT);
+
+    assert.equal(existsSync(entry), true, entry);
+    assert.equal(argOf(compactions[0], "--data-dir"), dir);
+  });
+});
