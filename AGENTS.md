@@ -7,6 +7,9 @@ Guidance for AI assistants working in this repository.
 - `npm run build` — `tsc` into `dist/`, then the bundled-extension gate
 - `npm test` — the Node test runner against **compiled** output
   (`dist/test/**/*.test.js`). Build first; `npm run build:all` does both.
+  Three test files run at a time: several of them spawn a process that maps
+  DuckDB's ~100 MB addon, and at the runner's default of one file per core
+  the suite starves its own children when other suites run beside it.
 - `npm run format` — prettier write + `eslint --fix`
 - `npm run ci-lint` — what CI checks
 - Single test file: `node --test dist/test/bench-run.test.js` after a build

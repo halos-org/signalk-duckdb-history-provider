@@ -21,7 +21,7 @@
     "lint": "eslint --fix",
     "format": "npm run prettier && npm run lint",
     "ci-lint": "eslint && prettier --check .",
-    "test": "node --test 'dist/test/**/*.test.js'",
+    "test": "node --test --test-concurrency=3 'dist/test/**/*.test.js'",
     "build:all": "npm run build && npm test",
     "fetch-extensions": "node tools/fetch-extensions.mjs",
     "prepublishOnly": "npm run build && npm run fetch-extensions && node tools/check-bundled-extensions.mjs --strict"
