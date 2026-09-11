@@ -22,20 +22,16 @@ const complete: Config = {
   dataDir: "/var/lib/history",
   retentionDays: 30,
   rollIntervalMinutes: 15,
-  compactHourly: false,
 };
 
 /**
- * The two defaults compaction turns on, asserted as literals rather than
- * through `CONFIG_DEFAULTS`.
- *
- * Every other test compares the schema against that object, so both move
- * together and neither is pinned. The interval matters twice over: at 60
- * minutes or more `compactClosedHour` returns before spawning anything, so
- * reverting it silently turns the whole feature off while the Admin UI still
- * shows it on.
+ * The default hourly compaction depends on, asserted as a literal rather than
+ * through `CONFIG_DEFAULTS`. Compaction always runs, so the interval is the
+ * only default that decides whether any merge happens: at 60 minutes or more
+ * `compactClosedHour` returns before spawning anything, so reverting the
+ * default to 60 leaves an hour holding one file and nothing to merge.
  */
-describe("the defaults hourly compaction depends on", () => {
+describe("the default hourly compaction depends on", () => {
   it("rolls every five minutes, which is what makes a merge worth doing", () => {
     assert.equal(CONFIG_DEFAULTS.rollIntervalMinutes, 5);
     assert.equal(
@@ -47,24 +43,6 @@ describe("the defaults hourly compaction depends on", () => {
       5,
     );
   });
-
-  it("compacts by default", () => {
-    assert.equal(CONFIG_DEFAULTS.compactHourly, true);
-    assert.equal(
-      (ConfigSchema.properties.compactHourly as unknown as { default: boolean })
-        .default,
-      true,
-    );
-  });
-
-  /** The upgrade path for every install that predates the option. */
-  it("treats an absent compactHourly as on", () => {
-    assert.equal(normalizeConfig({}).compactHourly, true);
-    assert.equal(
-      normalizeConfig({ compactHourly: false }).compactHourly,
-      false,
-    );
-  });
 });
 
 describe("ConfigSchema", () => {
@@ -73,7 +51,6 @@ describe("ConfigSchema", () => {
     // form field the operator can never set.
     const properties = Object.keys(ConfigSchema.properties);
     assert.deepEqual(properties.sort(), [
-      "compactHourly",
       "dataDir",
       "defaultSamplingRate",
       "flushBatchSize",
@@ -137,7 +114,6 @@ describe("ConfigSchema", () => {
       retentionDays: (ConfigSchema.properties.retentionDays as any).default,
       rollIntervalMinutes: (ConfigSchema.properties.rollIntervalMinutes as any)
         .default,
-      compactHourly: (ConfigSchema.properties.compactHourly as any).default,
     };
     assert.deepEqual(declared, { ...CONFIG_DEFAULTS });
   });
