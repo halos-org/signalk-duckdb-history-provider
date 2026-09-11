@@ -33,7 +33,7 @@ function run(
     harnessVersion: "0.1.0",
     label,
     startedAt: "2026-08-23T00:00:00.000Z",
-    host: "halpi",
+    host: "test-host",
     windows: 3,
     windowSeconds: 300,
     measuredWindowSeconds: summarize([300, 300, 300]),

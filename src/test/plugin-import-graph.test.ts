@@ -47,8 +47,13 @@ function importedSpecifiers(source: string): string[] {
   return specifiers;
 }
 
-function walk(entry: string): { bare: Set<string>; files: string[] } {
+function walk(entry: string): {
+  bare: Set<string>;
+  builtins: Set<string>;
+  files: string[];
+} {
   const bare = new Set<string>();
+  const builtins = new Set<string>();
   const files: string[] = [];
   const queue = [entry];
   const seen = new Set<string>();
@@ -61,12 +66,14 @@ function walk(entry: string): { bare: Set<string>; files: string[] } {
     for (const specifier of importedSpecifiers(readFileSync(file, "utf8"))) {
       if (specifier.startsWith(".")) {
         queue.push(resolve(dirname(file), specifier));
-      } else if (!specifier.startsWith("node:")) {
+      } else if (specifier.startsWith("node:")) {
+        builtins.add(specifier);
+      } else {
         bare.add(specifier);
       }
     }
   }
-  return { bare, files };
+  return { bare, builtins, files };
 }
 
 describe("the plugin's import graph", () => {
@@ -85,7 +92,48 @@ describe("the plugin's import graph", () => {
     );
   });
 
-  it("loads no DuckDB native library when a real process starts it", () => {
+  it("never reaches SQLite either", () => {
+    // The same rule as the engine, one layer down and easier to trip over:
+    // node:sqlite is a native module, and importing it here would put a
+    // database handle and its WAL in the server's heap. The hot store is the
+    // writer process's, and the writer is spawned rather than imported --
+    // which is only true as long as nothing on this side pulls in hot-store.ts
+    // for a constant.
+    const { builtins } = walk(ENTRY);
+    assert.ok(
+      !builtins.has("node:sqlite"),
+      "dist/index.js reaches node:sqlite. The hot store belongs to the " +
+        "writer process; import from writer/contract.js, not writer/main.js.",
+    );
+  });
+
+  it("keeps the engine out of the writer as well", () => {
+    // The writer is long-lived, so an import here would make the ~100 MB
+    // addon resident for as long as recording runs — the same cost as
+    // mapping it into the server, one process over. It reaches the roll by
+    // spawning it, which is the only reason the roll's memory is transient.
+    const writer = join(DIST, "writer", "main.js");
+    assert.ok(
+      existsSync(writer),
+      "build first: dist/writer/main.js is missing",
+    );
+    const { bare, builtins, files } = walk(writer);
+    // The positive control the plugin's own check has: without it, a walk that
+    // resolved nothing at all passes, and the writer could be importing the
+    // engine while this stays green.
+    assert.ok(files.length > 1, "expected the writer to import something");
+    assert.ok(
+      builtins.has("node:sqlite"),
+      "the writer must reach node:sqlite through hot-store.js; if it does " +
+        "not, this walk did not traverse and proves nothing",
+    );
+    assert.deepEqual(
+      [...bare].filter((specifier) => FORBIDDEN.test(specifier)),
+      [],
+    );
+  });
+
+  it("loads no DuckDB library when a real process starts and runs it", () => {
     // The static walk covers this package's own files. This covers everything
     // else — a dependency that pulls the addon in transitively would map it
     // just the same.
@@ -95,23 +143,36 @@ describe("the plugin's import graph", () => {
     // directory, exactly as the server would.
     const work = mkdtempSync(join(tmpdir(), "sk-parquet-probe-"));
     const probe = [
-      `import { mkdtempSync } from "node:fs";`,
       `const factory = (await import(${JSON.stringify(pathToFileURL(ENTRY).href)})).default;`,
+      `const failures = [];`,
+      `let handler = null;`,
       `const app = {`,
-      `  debug() {}, error() {},`,
-      `  setPluginStatus() {}, setPluginError() {},`,
+      `  debug() {}, error(...a) { failures.push(String(a[0])); },`,
+      `  setPluginStatus() {}, setPluginError(m) { failures.push(m); },`,
       `  getDataDirPath: () => ${JSON.stringify(work)},`,
       `  selfContext: "vessels.self",`,
+      // The stub the plugin actually needs. Without it start() threw at
+      // app.streambundle.getBus(), index.ts swallowed the throw into these
+      // no-op reporters, and the probe then measured a plugin that had bailed
+      // before doing anything -- passing for the wrong reason.
+      `  streambundle: { getBus: () => ({ onValue: (fn) => { handler = fn; return () => {}; } }) },`,
       `};`,
       `const plugin = factory(app);`,
       // Awaited: if start() ever becomes async and loads the engine lazily --
       // the case this test exists for -- an un-awaited call leaves the import
       // pending when the report is taken, and the probe reports nothing.
-      `await plugin.start({});`,
+      `await plugin.start({ defaultSamplingRate: 0 });`,
+      // Drive a delta through the real handler, so a lazy load on the
+      // per-sample path is reached too.
+      `handler?.({ context: "vessels.self", path: "a.b", value: 1, $source: "x" });`,
       `await plugin.stop?.();`,
+      // DuckDB only. node:sqlite is compiled into the Node binary rather than
+      // loaded as a shared object, and the host's own libsqlite3 is mapped by
+      // every process on macOS -- so this report cannot tell our use from the
+      // operating system's. The static walk above is what covers node:sqlite.
       `const loaded = process.report.getReport().sharedObjects`,
       `  .filter((p) => /duckdb/i.test(p));`,
-      `console.log(JSON.stringify(loaded));`,
+      `console.log(JSON.stringify({ loaded, failures, subscribed: handler !== null }));`,
     ].join("\n");
     try {
       const output = execFileSync(
@@ -122,7 +183,24 @@ describe("the plugin's import graph", () => {
         // cost a CI run.
         { encoding: "utf8", timeout: 30_000 },
       );
-      assert.deepEqual(JSON.parse(output.trim()), []);
+      const result = JSON.parse(output.trim()) as {
+        loaded: string[];
+        failures: string[];
+        subscribed: boolean;
+      };
+      // Assert the plugin got far enough to be worth measuring, before
+      // measuring. Without this the whole check passes on a start that threw.
+      assert.deepEqual(
+        result.failures,
+        [],
+        "the plugin reported a failure, so the probe measured an aborted start",
+      );
+      assert.equal(
+        result.subscribed,
+        true,
+        "the plugin never subscribed, so nothing after that line ran",
+      );
+      assert.deepEqual(result.loaded, []);
     } finally {
       rmSync(work, { recursive: true, force: true });
     }

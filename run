@@ -2,7 +2,7 @@
 #
 # usage: ./run command [argument ...]
 #
-# Commands for signalk-parquet-history-provider development.
+# Commands for signalk-duckdb-history-provider development.
 #
 
 set -o nounset
@@ -75,7 +75,7 @@ function check-extension {
 # Measurement
 
 function bench {
-  #@ Run the measurement harness (run|compare|selftest)
+  #@ Run the measurement harness (run/compare/selftest/roll/query/http-query)
   #@ Category: Measurement
   npm run build
   node dist/bench/cli.js "$@"
@@ -102,7 +102,7 @@ The build and the dependency install both run on the machine you invoke this
 from, so keep that a dev host. Nothing is compiled or downloaded on the device.
 
 Examples:
-  ./run deploy-halos halpi.hurma
+  ./run deploy-halos my-boat.local
   ./run deploy-halos local          # on the device itself
 USAGE
     return 1
@@ -446,7 +446,7 @@ function bumpversion {
 function help {
   #@ Show this help message
   #@ Category: Core
-  echo "signalk-parquet-history-provider - Development Commands"
+  echo "signalk-duckdb-history-provider - Development Commands"
   echo "======================================================"
   echo ""
   echo "Available commands:"

@@ -16,6 +16,6 @@ jobs:
   build-release:
     uses: halos-org/shared-workflows/.github/workflows/build-release.yml@main
     with:
-      package-name: signalk-parquet-history-provider
-      package-description: "Parquet history provider for Signal K: a SQLite hot store rolled into a Parquet tree, queried with DuckDB"
+      package-name: signalk-duckdb-history-provider
+      package-description: "History provider for Signal K: a SQLite hot store rolled into a Parquet tree, queried with DuckDB"
       build-deb: false

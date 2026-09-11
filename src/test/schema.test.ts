@@ -16,10 +16,56 @@ const complete: Config = {
   recordOthers: true,
   maxRecordedPaths: 50,
   maxRecordedContexts: 5,
+  flushIntervalMs: 2000,
+  flushBatchSize: 500,
+  maxBufferMB: 4,
   dataDir: "/var/lib/history",
   retentionDays: 30,
   rollIntervalMinutes: 15,
+  compactHourly: false,
 };
+
+/**
+ * The two defaults compaction turns on, asserted as literals rather than
+ * through `CONFIG_DEFAULTS`.
+ *
+ * Every other test compares the schema against that object, so both move
+ * together and neither is pinned. The interval matters twice over: at 60
+ * minutes or more `compactClosedHour` returns before spawning anything, so
+ * reverting it silently turns the whole feature off while the Admin UI still
+ * shows it on.
+ */
+describe("the defaults hourly compaction depends on", () => {
+  it("rolls every five minutes, which is what makes a merge worth doing", () => {
+    assert.equal(CONFIG_DEFAULTS.rollIntervalMinutes, 5);
+    assert.equal(
+      (
+        ConfigSchema.properties.rollIntervalMinutes as unknown as {
+          default: number;
+        }
+      ).default,
+      5,
+    );
+  });
+
+  it("compacts by default", () => {
+    assert.equal(CONFIG_DEFAULTS.compactHourly, true);
+    assert.equal(
+      (ConfigSchema.properties.compactHourly as unknown as { default: boolean })
+        .default,
+      true,
+    );
+  });
+
+  /** The upgrade path for every install that predates the option. */
+  it("treats an absent compactHourly as on", () => {
+    assert.equal(normalizeConfig({}).compactHourly, true);
+    assert.equal(
+      normalizeConfig({ compactHourly: false }).compactHourly,
+      false,
+    );
+  });
+});
 
 describe("ConfigSchema", () => {
   it("renders every option the plugin is configured with", () => {
@@ -27,8 +73,12 @@ describe("ConfigSchema", () => {
     // form field the operator can never set.
     const properties = Object.keys(ConfigSchema.properties);
     assert.deepEqual(properties.sort(), [
+      "compactHourly",
       "dataDir",
       "defaultSamplingRate",
+      "flushBatchSize",
+      "flushIntervalMs",
+      "maxBufferMB",
       "maxRecordedContexts",
       "maxRecordedPaths",
       "pathFilter",
@@ -76,6 +126,9 @@ describe("ConfigSchema", () => {
       samplingRates: (ConfigSchema.properties.samplingRates as any).default,
       recordSelf: (ConfigSchema.properties.recordSelf as any).default,
       recordOthers: (ConfigSchema.properties.recordOthers as any).default,
+      flushIntervalMs: (ConfigSchema.properties.flushIntervalMs as any).default,
+      flushBatchSize: (ConfigSchema.properties.flushBatchSize as any).default,
+      maxBufferMB: (ConfigSchema.properties.maxBufferMB as any).default,
       maxRecordedPaths: (ConfigSchema.properties.maxRecordedPaths as any)
         .default,
       maxRecordedContexts: (ConfigSchema.properties.maxRecordedContexts as any)
@@ -84,6 +137,7 @@ describe("ConfigSchema", () => {
       retentionDays: (ConfigSchema.properties.retentionDays as any).default,
       rollIntervalMinutes: (ConfigSchema.properties.rollIntervalMinutes as any)
         .default,
+      compactHourly: (ConfigSchema.properties.compactHourly as any).default,
     };
     assert.deepEqual(declared, { ...CONFIG_DEFAULTS });
   });
@@ -211,6 +265,19 @@ describe("normalizeConfig", () => {
     );
   });
 
+  it("rounds retention down to whole days", () => {
+    // Expiry drops whole UTC days, so half a day is not a boundary it has. The
+    // Admin UI's number field accepts 0.5 quite happily.
+    assert.equal(
+      normalizeConfig({ ...complete, retentionDays: 7.9 }).retentionDays,
+      7,
+    );
+    assert.equal(
+      normalizeConfig({ ...complete, retentionDays: 0.5 }).retentionDays,
+      0,
+    );
+  });
+
   it("rejects a non-finite number rather than propagating it", () => {
     const normalized = normalizeConfig({
       ...complete,
@@ -222,5 +289,59 @@ describe("normalizeConfig", () => {
       CONFIG_DEFAULTS.defaultSamplingRate,
     );
     assert.equal(normalized.retentionDays, CONFIG_DEFAULTS.retentionDays);
+  });
+});
+
+describe("count-shaped options are whole numbers", () => {
+  it("floors a fractional batch size instead of stalling the buffer", () => {
+    // splice() applies ToIntegerOrInfinity to its delete count, so a batch
+    // size of 0.5 removes nothing while isDue still reports a full batch: the
+    // buffer never drains, grows to its ceiling and starts evicting, with the
+    // plugin reporting "Recording" throughout. A number field accepts 0.5.
+    assert.equal(normalizeConfig({ flushBatchSize: 0.5 }).flushBatchSize, 1);
+    assert.equal(normalizeConfig({ flushBatchSize: 7.9 }).flushBatchSize, 7);
+    assert.equal(
+      normalizeConfig({ maxRecordedPaths: 2.5 }).maxRecordedPaths,
+      2,
+    );
+    assert.equal(
+      normalizeConfig({ maxRecordedContexts: 0.2 }).maxRecordedContexts,
+      1,
+    );
+  });
+
+  it("leaves the interval and the buffer size fractional, where it is harmless", () => {
+    // These are milliseconds and megabytes, compared rather than counted.
+    assert.equal(
+      normalizeConfig({ flushIntervalMs: 1500.5 }).flushIntervalMs,
+      1500.5,
+    );
+    assert.equal(normalizeConfig({ maxBufferMB: 0.5 }).maxBufferMB, 0.5);
+  });
+});
+
+describe("the roll interval has to describe a schedule", () => {
+  it("keeps an interval that divides the day", () => {
+    for (const minutes of [1, 5, 15, 30, 60, 120, 240, 720, 1440]) {
+      assert.equal(
+        normalizeConfig({ rollIntervalMinutes: minutes }).rollIntervalMinutes,
+        minutes,
+      );
+    }
+  });
+
+  it("falls back when the interval does not divide the day", () => {
+    // "Aligned to UTC midnight" has no meaning for an interval that does not
+    // divide 1,440 minutes: the schedule either drifts or jumps at midnight,
+    // and which one it does is an accident of the arithmetic. The rows
+    // themselves are safe either way — each lands in the date directory its
+    // own timestamp names — so this is about the schedule, not the tree.
+    for (const minutes of [7, 100, 1441, 0.5]) {
+      assert.equal(
+        normalizeConfig({ rollIntervalMinutes: minutes }).rollIntervalMinutes,
+        CONFIG_DEFAULTS.rollIntervalMinutes,
+        `${minutes} does not divide 1,440`,
+      );
+    }
   });
 });

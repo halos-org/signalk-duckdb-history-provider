@@ -99,13 +99,27 @@ describe("the published package", () => {
     assert.equal(pkg.type, "module");
   });
 
-  it("declares an id matching the package name", () => {
+  it("declares the package name without its scope as the plugin id", () => {
     // Signal K keys the plugin's config file and its data directory off
-    // plugin.id declared in code, while the app store derives an id from the
-    // package name. Editing either alone strands every device's data on
-    // upgrade, and nothing fails at build time.
+    // plugin.id declared in code, and holds the package name separately as
+    // plugin.packageName (`signalk-server/src/interfaces/plugins.ts:1222`), so
+    // the two are allowed to differ and here they do: the id becomes a
+    // filename and a scope would put a slash in it.
+    //
+    // They still have to move together. Changing the id alone strands every
+    // device's config and data directory on upgrade, and nothing fails at
+    // build time — so this pins the one relation that is left.
     const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
-    assert.equal(PLUGIN_ID, pkg.name);
+    assert.equal(PLUGIN_ID, String(pkg.name).replace(/^@[^/]+\//, ""));
+  });
+
+  it("publishes the scoped package publicly", () => {
+    // A scoped package defaults to restricted. Publishing this one restricted
+    // would put it behind npm authentication on every device that installs it,
+    // and the failure would land at install time on a boat rather than in CI.
+    const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+    if (!String(pkg.name).startsWith("@")) return;
+    assert.equal(pkg.publishConfig?.access, "public");
   });
 
   it("keeps VERSION and package.json on the same version", () => {

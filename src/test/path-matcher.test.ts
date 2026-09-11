@@ -302,3 +302,30 @@ describe("Throttle", () => {
     );
   });
 });
+
+describe("a clock that moves backwards", () => {
+  it("admits rather than dropping for the length of the jump", () => {
+    // No RTC on these devices: fake-hwclock restores a saved time at boot and
+    // gpsd or NTP then steps it. The drop path returns before recording the
+    // pair, so a backwards step used to freeze that path until wall-clock time
+    // caught up — a silent outage as long as the correction, measured at a
+    // full hour for a one-hour step.
+    const throttle = new Throttle();
+    const base = 1_700_000_000_000;
+
+    assert.equal(throttle.shouldDrop("a.b", "self", 2000, base), false);
+    const stepped = base - 3_600_000;
+    assert.equal(
+      throttle.shouldDrop("a.b", "self", 2000, stepped),
+      false,
+      "a backwards step was read as a sample arriving too soon",
+    );
+    // And the pair is re-anchored to the new clock, so throttling resumes
+    // normally rather than admitting everything from here on.
+    assert.equal(throttle.shouldDrop("a.b", "self", 2000, stepped + 1), true);
+    assert.equal(
+      throttle.shouldDrop("a.b", "self", 2000, stepped + 2000),
+      false,
+    );
+  });
+});

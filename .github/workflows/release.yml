@@ -53,12 +53,15 @@ jobs:
             echo "::error::VERSION ($VERSION) does not match package.json ($PKG_VERSION)"
             exit 1
           fi
-          if npm view signalk-parquet-history-provider@"$VERSION" version 2>/dev/null; then
+          # The scoped name, read from package.json rather than written out:
+          # publishing checks one name and this check must not read another.
+          PKG_NAME=$(node -p "require('./package.json').name")
+          if npm view "$PKG_NAME@$VERSION" version 2>/dev/null; then
             # A +N-only merge (no VERSION change) cuts a new GitHub release that
             # publishes nothing here. Surface it loudly so a "published" release
             # that ships nothing to npm is not mistaken for a real release --
             # bump VERSION to publish a new version.
-            echo "::warning::signalk-parquet-history-provider@$VERSION is already on npm; nothing to publish. Bump VERSION to release a new version."
+            echo "::warning::$PKG_NAME@$VERSION is already on npm; nothing to publish. Bump VERSION to release a new version."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "Version $VERSION not found on npm, will publish"

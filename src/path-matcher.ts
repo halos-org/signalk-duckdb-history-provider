@@ -156,7 +156,15 @@ export class Throttle {
     // also skips recording the pair, it stays dropped until the clock passes
     // minMs. Date.now() hides this; nothing else does.
     const last = this.lastWrite.get(key);
-    if (last !== undefined && now - last < minMs) return true;
+    // `now < last` is a clock that moved backwards, not a sample arriving too
+    // soon. Marine devices have no RTC: fake-hwclock restores a saved time at
+    // boot and gpsd or NTP then steps it, in either direction. Treating a
+    // backwards step as "too soon" drops the pair for the length of the jump,
+    // because the drop path returns before the stored timestamp is corrected
+    // and so never clears itself. Measured against a one-hour step: every path
+    // stopped recording for the full hour, with no log line and the plugin
+    // still reporting "Recording".
+    if (last !== undefined && now >= last && now - last < minMs) return true;
     if (this.lastWrite.size >= this.maxEntries && !this.lastWrite.has(key)) {
       this.evict(now);
     }

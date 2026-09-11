@@ -1,14 +1,17 @@
 {
-  "name": "signalk-parquet-history-provider",
+  "name": "@halos-org/signalk-duckdb-history-provider",
   "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
-  "description": "Parquet history provider for Signal K: a SQLite hot store rolled into a Parquet tree, queried with DuckDB — no database server",
+  "description": "History provider for Signal K: a SQLite hot store rolled into a Parquet tree, queried with DuckDB \u2014 no database server",
   "keywords": [
     "signalk-node-server-plugin",
     "signalk-category-database"
   ],
   "signalk": {
-    "displayName": "Parquet History"
+    "displayName": "DuckDB History"
   },
   "main": "dist/index.js",
   "scripts": {
@@ -18,19 +21,19 @@
     "lint": "eslint --fix",
     "format": "npm run prettier && npm run lint",
     "ci-lint": "eslint && prettier --check .",
-    "test": "node --test 'dist/test/**/*.test.js'",
+    "test": "node --test --test-concurrency=3 'dist/test/**/*.test.js'",
     "build:all": "npm run build && npm test",
     "fetch-extensions": "node tools/fetch-extensions.mjs",
     "prepublishOnly": "npm run build && npm run fetch-extensions && node tools/check-bundled-extensions.mjs --strict"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   },
   "author": "Matti Airas <matti.airas@hatlabs.fi>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/halos-org/signalk-parquet-history-provider"
+    "url": "https://github.com/halos-org/signalk-duckdb-history-provider"
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.4",
@@ -51,7 +54,7 @@
     "typescript-eslint": "^8.58.0"
   },
   "bugs": {
-    "url": "https://github.com/halos-org/signalk-parquet-history-provider/issues"
+    "url": "https://github.com/halos-org/signalk-duckdb-history-provider/issues"
   },
-  "homepage": "https://github.com/halos-org/signalk-parquet-history-provider#readme"
+  "homepage": "https://github.com/halos-org/signalk-duckdb-history-provider#readme"
 }
