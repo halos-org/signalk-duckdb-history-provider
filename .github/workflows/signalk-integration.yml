@@ -3,10 +3,12 @@
 # modules in isolation, and package-e2e asserts the tarball's shape -- not
 # that signalk-server finds the package, reads its schema and starts it.
 #
-# It does not yet assert history-provider registration, because this build
-# registers none. The v2 and v1 surfaces are issues 171 and 172 under
-# https://github.com/halos-org/halos/issues/152, and the assertion belongs
-# with them.
+# It asserts the history surfaces answer, because that is the only place the
+# whole chain is exercised at once: sample NMEA into the recorder, through the
+# socket to the writer, into SQLite, out through the query service's DuckDB and
+# back as JSON. Both API versions are checked -- the v2 REST endpoints, and the
+# v1 snapshot, which additionally goes through the server's own tree builder.
+# v1 playback is a WebSocket and is covered by the unit suite instead.
 
 name: Signal K Integration
 
@@ -50,6 +52,11 @@ jobs:
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
           npm run build
+          # extensions/ is gitignored and downloaded, so a checkout has none.
+          # `prepublishOnly` fetches them for a real publish, but npm does not
+          # run that hook for `npm pack` -- so without this the tarball ships
+          # no sqlite_scanner and every hot-store query below answers 400.
+          npm run fetch-extensions
           echo "PLUGIN_TGZ=$(npm pack --ignore-scripts --pack-destination /tmp)" >> "$GITHUB_ENV"
 
       - name: Install signalk-server and the plugin
@@ -64,9 +71,13 @@ jobs:
         run: |
           cd /tmp/sk-test
           mkdir -p plugin-config-data
-          # The plugin id is declared in the plugin's own code, not derived from
-          # the package name, so it is read back rather than assumed.
-          PLUGIN_ID=$(node -p "require('/tmp/sk-test/node_modules/signalk-parquet-history-provider/dist/plugin-id.js').PLUGIN_ID")
+          # Two names, and they are deliberately different: the package is
+          # scoped and the plugin id is not, because the id becomes a config
+          # filename and a scoped name would put a slash in it. So both are
+          # read rather than assumed -- resolving by package name also means a
+          # rename cannot leave a stale node_modules path here.
+          PKG_NAME=$(node -p "require('$GITHUB_WORKSPACE/package.json').name")
+          PLUGIN_ID=$(node -p "require('$PKG_NAME/dist/plugin-id.js').PLUGIN_ID")
           echo "PLUGIN_ID=$PLUGIN_ID" >> "$GITHUB_ENV"
           cat > "plugin-config-data/${PLUGIN_ID}.json" <<JSON
           { "enabled": true, "configuration": {} }
@@ -104,7 +115,7 @@ jobs:
             const plugin = plugins.find((p) => p.id === process.env.PLUGIN_ID);
             const properties = Object.keys(plugin.schema?.properties ?? {});
             console.log(properties.join(", "));
-            const required = ["pathFilter", "defaultSamplingRate", "dataDir", "rollIntervalMinutes"];
+            const required = ["pathFilter", "defaultSamplingRate", "dataDir", "rollIntervalMinutes", "retentionDays"];
             const missing = required.filter((name) => !properties.includes(name));
             if (missing.length > 0) {
               console.error(`::error::the config form is missing ${missing.join(", ")}`);
@@ -134,7 +145,110 @@ jobs:
             echo "  $DATA_DIR/$sub"
           done
 
+          # The whole chain, and the only check that covers it end to end: the
+          # sample stream reached the recorder, the socket, SQLite, the query
+          # service's DuckDB and came back as JSON. A server with no provider
+          # registered answers 501 here, which is what this build did before
+          # the v2 surface existed.
+          echo "--- history v2 surface ---"
+          HISTORY="http://localhost:3000/signalk/v2/api/history"
+          # A path the sample stream always carries -- plaka.log holds 7250
+          # $IIDBT sentences -- so the answers below are built by this plugin's
+          # own assembly rather than by an empty short circuit.
+          ASKED=environment.depth.belowTransducer
+
+          # `to` is recomputed on every attempt below, so it never falls behind
+          # while the loop waits.
+          window() {
+            FROM=$(node -e 'console.log(new Date(Date.now() - 3600000).toISOString())')
+            TO=$(node -e 'console.log(new Date().toISOString())')
+          }
+          nonEmpty() {
+            WHAT="$1" node -e '
+              const body = JSON.parse(require("fs").readFileSync(0, "utf8"));
+              if (Array.isArray(body) && body.length > 0) process.exit(0);
+              console.error(`::error::history/${process.env.WHAT} answered ${JSON.stringify(body)}`);
+              process.exit(1);
+            '
+          }
+
+          # A recorded sample reaches the store a flush interval after the
+          # server starts answering, and the loop above stops waiting at the
+          # first answer -- seconds earlier. The assertions below require a
+          # non-empty body, so they need the store to hold something first.
+          echo "waiting for $ASKED to reach the store"
+          for _ in $(seq 1 60); do
+            window
+            if curl -sf -o /tmp/paths.json "$HISTORY/paths?from=$FROM&to=$TO" &&
+               grep -q "\"$ASKED\"" /tmp/paths.json; then
+              break
+            fi
+            sleep 2
+          done
+
+          CODE=$(curl -s -o /tmp/contexts.json -w '%{http_code}' "$HISTORY/contexts?from=$FROM&to=$TO")
+          [ "$CODE" = "200" ] || {
+            echo "::error::history/contexts answered $CODE: $(cat /tmp/contexts.json)"
+            cat /tmp/sk.log; exit 1; }
+          nonEmpty contexts < /tmp/contexts.json || { cat /tmp/sk.log; exit 1; }
+          echo "  contexts: $(cat /tmp/contexts.json)"
+
+          CODE=$(curl -s -o /tmp/paths.json -w '%{http_code}' "$HISTORY/paths?from=$FROM&to=$TO")
+          [ "$CODE" = "200" ] || {
+            echo "::error::history/paths answered $CODE: $(cat /tmp/paths.json)"
+            cat /tmp/sk.log; exit 1; }
+          nonEmpty paths < /tmp/paths.json || { cat /tmp/sk.log; exit 1; }
+          echo "  paths: $(head -c 300 /tmp/paths.json)"
+
+          CODE=$(curl -s -o /tmp/values.json -w '%{http_code}' \
+            "$HISTORY/values?from=$FROM&to=$TO&resolution=10&paths=$ASKED")
+          [ "$CODE" = "200" ] || {
+            echo "::error::history/values answered $CODE: $(cat /tmp/values.json)"
+            cat /tmp/sk.log; exit 1; }
+          ASKED="$ASKED" node -e '
+            const answer = JSON.parse(require("fs").readFileSync("/tmp/values.json", "utf8"));
+            const series = answer.values?.[0];
+            if (series?.path !== process.env.ASKED) {
+              console.error(`::error::the response describes ${JSON.stringify(answer.values)}, not ${process.env.ASKED}`);
+              process.exit(1);
+            }
+            // The rows are the point. A provider that echoes the requested
+            // series and queries nothing answers 200 with an empty `data`.
+            if (!Array.isArray(answer.data) || answer.data.length === 0) {
+              console.error("::error::history/values returned no rows");
+              process.exit(1);
+            }
+            console.log(`  values: ${answer.data.length} rows for ${series.path} as ${series.method}`);
+          ' || { cat /tmp/sk.log; exit 1; }
+
+          # The v1 snapshot route, which is the half of that surface a shell can
+          # reach -- playback is a WebSocket and is covered by the unit suite.
+          # It is worth its own check because it is the one request that goes
+          # through the server's own tree builder: the route maps `self` in the
+          # URL to the vessel's id before walking what it built, so a provider
+          # returning the context the store spells answers 200 here with
+          # nothing, or throws inside the builder.
+          echo "--- history v1 snapshot ---"
+          AT=$(node -e 'console.log(new Date().toISOString())')
+          SNAPSHOT="http://localhost:3000/signalk/v1/snapshot"
+          LEAF=$(echo "$ASKED" | tr '.' '/')
+          CODE=$(curl -s -o /tmp/snapshot.json -w '%{http_code}' \
+            "$SNAPSHOT/vessels/self/$LEAF?time=$AT")
+          [ "$CODE" = "200" ] || {
+            echo "::error::the v1 snapshot answered $CODE: $(cat /tmp/snapshot.json)"
+            cat /tmp/sk.log; exit 1; }
+          node -e '
+            const leaf = JSON.parse(require("fs").readFileSync("/tmp/snapshot.json", "utf8"));
+            if (typeof leaf?.value !== "number") {
+              console.error(`::error::the v1 snapshot returned ${JSON.stringify(leaf)}`);
+              process.exit(1);
+            }
+            console.log(`  snapshot: ${leaf.value} at ${leaf.timestamp}`);
+          ' || { cat /tmp/sk.log; exit 1; }
+
           # The premise of the design: the server pays for no storage engine.
+          # Checked after a query has run, which is the moment an engine would
+          # have been mapped if anything about the query path were in-process.
           # /tmp/sk.pid is npx's, not the server's, so the process is found by
           # name -- and not finding it fails, because a check that cannot
           # locate its target must not report success.

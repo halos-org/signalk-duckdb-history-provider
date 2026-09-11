@@ -4,12 +4,24 @@
  *   node dist/bench/cli.js run --label sqhp --subject signalk:pid=1234 -o sqhp.json
  *   node dist/bench/cli.js compare control.json sqhp.json parquet.json
  *   node dist/bench/cli.js selftest
+ *   node dist/bench/cli.js roll --data-dir /path/to/a/copy --max-rowid 1267241
+ *
+ *   node dist/bench/cli.js query --data-dir /path --from <ms> --to <ms>
+ *   node dist/bench/cli.js http-query --provider <plugin id> --from <iso> --to <iso>
  *
  * `run` measures one condition. `compare` puts several side by side, which is
  * the only form in which these numbers mean anything. `selftest` runs the
  * whole path against a load generator with a known duty cycle, so a machine
  * can show that the harness reports what it should before anyone trusts it
- * about a real workload.
+ * about a real workload. `roll` measures one roll, which `run` cannot: a roll
+ * has no steady state and is gone before a window closes. `query` measures one
+ * query the same way, and for the same reason.
+ *
+ * `query` and `http-query` ask different questions. `query` times this
+ * plugin's DuckDB engine against a tree on disk. `http-query` times a round
+ * trip over the Signal K v2 history route, addressed to one provider by plugin
+ * id — the only surface on which providers backed by different engines can be
+ * compared, and the one a dashboard actually calls.
  */
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -30,6 +42,12 @@ import {
  * note that describes it cannot disagree. */
 const SELFTEST_WRITE_INTERVAL_MS = 250;
 import { createProcSampler, parseSubjectSpec } from "./subjects.js";
+import { measureOneShot } from "./one-shot.js";
+import { measureHttpQuery } from "./http-query.js";
+import { QueryRunner } from "../query/duck.js";
+import type { QueryRequest } from "../query/duck.js";
+import { writerPaths } from "../writer/contract.js";
+import { probeLiveWriter } from "../writer/server.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -39,7 +57,12 @@ async function main(): Promise<void> {
   if (command === "run") return doRun(rest);
   if (command === "compare") return doCompare(rest);
   if (command === "selftest") return doSelftest(rest);
-  console.error("usage: cli.js run|compare|selftest ... (see the file header)");
+  if (command === "roll") return doRoll(rest);
+  if (command === "query") return doQuery(rest);
+  if (command === "http-query") return doHttpQuery(rest);
+  console.error(
+    "usage: cli.js run|compare|selftest|roll|query|http-query ... (see the file header)",
+  );
   process.exitCode = 2;
 }
 
@@ -103,6 +126,244 @@ async function doCompare(argv: string[]): Promise<void> {
     console.error(`wrote ${values.out}`);
   } else {
     process.stdout.write(table);
+  }
+}
+
+/**
+ * One roll, measured.
+ *
+ * **Point this at a copy of a data directory, never at a live one.** A roll
+ * writes into the tree and does not truncate the hot store, so a roll run
+ * beside a live writer puts those rows in the tree twice — once here, once
+ * when the writer rolls them itself under a different name. The live-writer
+ * probe is what enforces that: if anything answers on the socket, this
+ * refuses.
+ */
+async function doRoll(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      "data-dir": { type: "string" },
+      "max-rowid": { type: "string" },
+      "memory-limit": { type: "string" },
+      out: { type: "string", short: "o" },
+    },
+  });
+  const dataDir = values["data-dir"];
+  if (!dataDir) throw new Error("--data-dir is required");
+  if (!values["max-rowid"]) throw new Error("--max-rowid is required");
+  requireLinux();
+
+  if (await probeLiveWriter(writerPaths(dataDir).socket)) {
+    throw new Error(
+      `a writer is live on ${dataDir}. Measuring a roll there would write ` +
+        `its rows into the tree twice — copy the data directory first.`,
+    );
+  }
+
+  const result = await measureOneShot({
+    command: process.execPath,
+    args: [
+      join(HERE, "..", "roll", "main.js"),
+      "--data-dir",
+      dataDir,
+      "--max-rowid",
+      values["max-rowid"],
+      "--roll-id",
+      String(Date.now()),
+      ...(values["memory-limit"]
+        ? ["--memory-limit", values["memory-limit"]]
+        : []),
+    ],
+    selfReportedPeak: (stdout) => {
+      try {
+        const summary = JSON.parse(stdout.trim().split("\n").pop() ?? "") as {
+          peakRssBytes?: number | null;
+        };
+        return summary.peakRssBytes ?? null;
+      } catch {
+        return null;
+      }
+    },
+  });
+
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `the roll exited ${result.exitCode}: ${result.stderr.trim()}`,
+    );
+  }
+  const json = `${JSON.stringify(
+    {
+      peakMb: +(result.peakBytes / 1048576).toFixed(1),
+      peakSource: result.peakSource,
+      sampledPeakMb: +(result.sampledPeakBytes / 1048576).toFixed(1),
+      samples: result.samples,
+      wallMs: Math.round(result.wallMs),
+      roll: JSON.parse(result.stdout.trim().split("\n").pop() ?? "null"),
+    },
+    null,
+    2,
+  )}\n`;
+  if (values.out) {
+    writeFileSync(values.out, json);
+    console.error(`wrote ${values.out}`);
+  } else {
+    process.stdout.write(json);
+  }
+}
+
+/**
+ * A series of queries against one query service, measured through the client
+ * the plugin uses.
+ *
+ * **Every run is reported, and the first one is not an outlier to discard.**
+ * It pays to start the engine — 336–375 ms on the device — and every run after
+ * does not, which is the whole shape of this design. A mean across them would
+ * describe neither.
+ *
+ * The service's own resident size comes back with each answer, because a
+ * process that stays is judged on what it holds as well as on what it takes.
+ *
+ * Safe against a live writer, unlike `roll`: a query only reads.
+ */
+async function doQuery(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      "data-dir": { type: "string" },
+      kind: { type: "string", default: "range" },
+      from: { type: "string" },
+      to: { type: "string" },
+      context: { type: "string", default: "self" },
+      path: { type: "string", multiple: true, default: [] },
+      limit: { type: "string" },
+      repeat: { type: "string", default: "3" },
+      "memory-limit": { type: "string" },
+      out: { type: "string", short: "o" },
+    },
+  });
+  const dataDir = values["data-dir"];
+  if (!dataDir) throw new Error("--data-dir is required");
+  if (!values.from || !values.to) {
+    throw new Error("--from and --to are required, in epoch milliseconds");
+  }
+  if (!["range", "paths", "contexts"].includes(values.kind)) {
+    throw new Error(`--kind "${values.kind}" is not range, paths or contexts`);
+  }
+  requireLinux();
+
+  // Through `numberOr`, which names the offending text. `Number("noon")` is
+  // NaN, `JSON.stringify` writes it as null, and the query then fails with a
+  // message about a field rather than about the flag that set it.
+  const request = {
+    kind: values.kind,
+    from: numberOr(values.from, 0),
+    to: numberOr(values.to, 0),
+    context: values.context,
+    ...(values.path.length > 0 ? { paths: values.path } : {}),
+    ...(values.limit ? { limit: numberOr(values.limit, 0) } : {}),
+  } as QueryRequest;
+  const repeat = numberOr(values.repeat, 3);
+  if (repeat < 1) throw new Error(`--repeat ${repeat} measures nothing`);
+
+  const runner = new QueryRunner({
+    dataDir,
+    memoryLimit: values["memory-limit"],
+    onError: (line) => console.error(line),
+  });
+  const runs = [];
+  try {
+    for (let attempt = 0; attempt < repeat; attempt += 1) {
+      const result = await runner.run(request);
+      runs.push({
+        wallMs: Math.round(result.wallMs),
+        rows: result.rows.length,
+        truncated: result.truncated,
+        treeFiles: result.treeFiles,
+        serviceMb: mb(result.rssBytes),
+        servicePeakMb: mb(result.peakRssBytes),
+      });
+    }
+  } finally {
+    runner.stop();
+  }
+
+  const json = `${JSON.stringify({ request, runs }, null, 2)}\n`;
+  if (values.out) {
+    writeFileSync(values.out, json);
+    console.error(`wrote ${values.out}`);
+  } else {
+    process.stdout.write(json);
+  }
+}
+
+function mb(bytes: number | null): number | null {
+  return bytes === null ? null : +(bytes / 1048576).toFixed(1);
+}
+
+/**
+ * One query, timed over the v2 history route against a named provider.
+ *
+ * Unlike `query`, this needs a running Signal K server rather than a data
+ * directory, and it works against any provider the server has registered — not
+ * only this one. It does not require Linux: nothing here reads /proc. It does
+ * want to run on the device, because a round trip measured from elsewhere
+ * measures the network.
+ */
+async function doHttpQuery(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      "base-url": { type: "string", default: "http://localhost:3000" },
+      provider: { type: "string" },
+      from: { type: "string" },
+      to: { type: "string" },
+      path: { type: "string", multiple: true, default: [] },
+      resolution: { type: "string" },
+      context: { type: "string" },
+      repeat: { type: "string", default: "4" },
+      "timeout-seconds": { type: "string" },
+      out: { type: "string", short: "o" },
+    },
+  });
+  if (!values.provider) {
+    throw new Error(
+      "--provider names the plugin id to address; it is required",
+    );
+  }
+  if (!values.from || !values.to) {
+    throw new Error("--from and --to are required, as ISO instants");
+  }
+  if (values.path.length === 0) {
+    throw new Error("--path is required, and may be repeated");
+  }
+
+  const result = await measureHttpQuery(
+    {
+      baseUrl: values["base-url"],
+      provider: values.provider,
+      from: values.from,
+      to: values.to,
+      paths: values.path,
+      ...(values.resolution
+        ? { resolution: numberOr(values.resolution, 0) }
+        : {}),
+      ...(values.context ? { context: values.context } : {}),
+    },
+    {
+      repeat: numberOr(values.repeat, 4),
+      ...(values["timeout-seconds"]
+        ? { timeoutMs: numberOr(values["timeout-seconds"], 60) * 1000 }
+        : {}),
+    },
+  );
+
+  const json = `${JSON.stringify(result, null, 2)}\n`;
+  if (values.out) {
+    writeFileSync(values.out, json);
+    console.error(`wrote ${values.out}`);
+  } else {
+    process.stdout.write(json);
   }
 }
 

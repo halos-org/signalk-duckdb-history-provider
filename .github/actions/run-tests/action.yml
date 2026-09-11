@@ -28,14 +28,23 @@ runs:
       run: npm run ci-lint
       shell: bash
 
+    - name: Fetch the bundled DuckDB extensions
+      # The roll suite spawns the real roll process, which loads
+      # sqlite_scanner from extensions/ — so without this the roll's tests
+      # skip themselves and the unit's core behaviour goes unverified here.
+      # tsc directly rather than `npm run build`, whose bundled-extension gate
+      # refuses the very state this step repairs.
+      #
+      # Whether the binary loads OFFLINE on the device's architecture is a
+      # different question, and duckdb-extension.yml is what answers it.
+      run: |
+        npx tsc
+        node tools/fetch-extensions.mjs
+      shell: bash
+
     - name: Build and test
       # build:all is build -> test. The suites execute the compiled output in
       # dist/, so building is not an extra step here, it is what makes the
       # tests runnable at all.
-      #
-      # No DuckDB extension binaries are fetched: the build gate passes when
-      # extensions/ is absent, which is the state of any clone. Whether the real
-      # binary loads offline on the device's architecture is a different
-      # question, and duckdb-extension.yml is what answers it.
       run: npm run build:all
       shell: bash

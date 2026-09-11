@@ -72,9 +72,13 @@ jobs:
           npm init -y > /dev/null
           npm install "/tmp/$(basename "$TGZ")"
           cd /tmp/installed
+          # Resolved by package name rather than by a node_modules path, so a
+          # rename cannot leave this pointing at a directory that is no longer
+          # there -- which would fail the offline check for the wrong reason.
+          PKG_NAME=$(node -p "require('$GITHUB_WORKSPACE/package.json').name")
           docker run --rm --network none \
             -v /tmp/installed:/w -w /w node:24 \
-            node node_modules/signalk-parquet-history-provider/dist/duckdb/check-extension.js
+            node "node_modules/$PKG_NAME/dist/duckdb/check-extension.js"
 
       - name: Refuse a build whose extension does not match the engine
         # The gate itself, exercised. Asserting on the message, not just on a

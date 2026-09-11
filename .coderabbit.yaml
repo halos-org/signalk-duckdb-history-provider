@@ -1,0 +1,188 @@
+language: en-US
+
+reviews:
+  profile: assertive
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    ignore_title_keywords:
+      - "chore(release):"
+      - "chore(deps):"
+      - "chore(deps-dev):"
+      - "[skip review]"
+      - "WIP"
+    ignore_usernames:
+      - "release-please[bot]"
+      - "renovate[bot]"
+      - "dependabot[bot]"
+      - "github-actions[bot]"
+
+  pre_merge_checks:
+    # Off, because the 80% default measures a convention this repository
+    # deliberately does not follow. CLAUDE.md asks for rare, short comments that
+    # explain *why* at the point of the decision, so the explanation for
+    # `writePendingRoll`, `defaultSpawn` or `rollIdSegment` sits inside the body
+    # and `roll()`'s sits in the module block above it. Coverage counts none of
+    # those and reads the file as undocumented. Left on, every PR here carries a
+    # warning nobody can clear without padding the code, which is how a warning
+    # stops meaning anything.
+    #
+    # Quoted: bare `off` is a YAML 1.1 boolean, and this field takes a string.
+    docstrings:
+      mode: "off"
+
+  path_filters:
+    - "!**/package-lock.json"
+    - "!**/dist/**"
+    - "!**/node_modules/**"
+    - "!extensions/**"
+
+  high_level_summary_instructions: |
+    Write summaries in present tense. Describe what the code does, not what
+    it did. Skip filler like "This PR" — go straight to the change.
+
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        ## What this is
+
+        A Signal K server plugin that records vessel deltas into a SQLite hot
+        store, rolls that into a Parquet tree, and serves both Signal K history
+        API surfaces by spawning DuckDB over the tree plus the hot store. There
+        is no database server.
+
+        It is a peer alternative to `signalk-questdb-history-provider`, chosen
+        per device. Nothing in that repository changes because of this one.
+        Judge changes as a general-purpose Signal K plugin: they should suit any
+        installation, not one boat.
+
+        ## The rule everything rests on
+
+        **The Signal K process does path filtering, rate capping and a socket
+        write, and no storage work whatsoever.** Everything else runs in its own
+        process.
+
+        So `src/index.ts` and everything it imports must never reach
+        `@duckdb/node-api` — the native addon lives in
+        `@duckdb/node-bindings-<platform>`, not the wrapper — nor `node:sqlite`,
+        which is also native and would put a database handle and its WAL in the
+        server's heap. Flag any import, `require`, `createRequire` or dynamic
+        import on the plugin's side that reaches either, including a lazily
+        loaded one inside a handler: a check on module evaluation alone would
+        not catch that, which is why the guard also starts a real process and
+        reads what it mapped.
+
+        `src/writer/main.ts` is the writer process's entry point. Importing it
+        from the plugin would run the writer inside the Signal K process;
+        `src/writer/contract.ts` exists to hold what both sides need.
+
+        ## Hot path
+
+        `Recorder.handle` runs on every Signal K delta. Keep it cheap: no
+        logging inside it beyond the bounded over-cap notice, and filter and
+        rate-cap before doing per-sample work.
+
+        ## Config schema is the source of truth
+
+        `src/config/schema.ts` uses TypeBox, and the package is the **unscoped
+        `typebox` (1.x)**, not `@sinclair/typebox`, which stopped at 0.34. The
+        schema is both the JSON Schema the Admin UI renders and the source of
+        the `Config` type. Add options there only, and add a README row — a test
+        enforces the pairing.
+
+        ## The plugin id lives in one file
+
+        `src/plugin-id.ts` exports `PLUGIN_ID`. The id reappears as `plugin.id`,
+        as the `handleMessage` sender and in the config filename; none of those
+        mismatches fails at build time. Flag any literal id string.
+
+        ## Copied files
+
+        `src/delta-routing.ts`, `src/path-matcher.ts` and `src/time-range.ts`
+        are copies from the sibling provider, with their suites. Their behaviour
+        is deliberately identical, because Unit 4c reproduces that provider's
+        history contract. Flag a behaviour change in them that is not also
+        raised against the sibling; do not flag them for divergence from local
+        style.
+
+        ## TypeScript
+
+        - Strict mode. Do not loosen `tsconfig.json`.
+        - Relative imports carry the `.js` extension (`./config/schema.js`, from
+          a `.ts` source). Node's ESM rule under `moduleResolution: "nodenext"`.
+          Do not suggest `"bundler"` resolution to make it go away; it would
+          emit unresolvable specifiers instead of failing the build.
+        - Node `>= 22`, and `node:sqlite`'s API is identical on 22, 24 and 26.
+
+        ## Tests
+
+        `src/test/` uses `node:test` and runs against the **compiled** JS in
+        `dist/test/`. Build before testing (`npm run build:all`).
+
+        Flag a test that cannot fail: one asserting on source text rather than
+        behaviour, one whose assertion is true by construction, or one scanning
+        a log without first establishing that the path which writes that log
+        actually ran.
+
+        `tsc` here has no `noUnusedLocals`, so it will not report an import or
+        helper left behind by a removal. Check by hand.
+
+        ## Privacy
+
+        This repository is public. Flag anything that discloses our local IT
+        infrastructure, anywhere in the tree — hostnames, domain names, IP
+        addresses, internal URLs, port assignments, account names — including
+        test fixtures, usage examples and comments. Placeholders only
+        (`my-boat.local`); naming the hardware is fine, since HALPI2 is a
+        product rather than an installation.
+
+        Do not flag marine-domain data. Vessel names, MMSIs, AIS targets,
+        navigational-aid names and place names are ordinary test data here and
+        need no redaction.
+
+        Flag any log or error message that could carry a recorded *value*. Those
+        lines reach the Signal K log and ship in support bundles; counts, path
+        names and error classes are fine, a tank level or a position is not.
+
+        ## Echo comments
+
+        Flag any comment that merely restates the code. Comments should explain
+        why, and be written for a reader who never saw the diff: no narrating
+        the change, no "fixes bug X", no "we used to do Y".
+
+        ## Documentation drift
+
+        Flag any `.md` file carrying implementation status, progress markers or
+        "currently implemented as X" wording. Build narratives belong in PR
+        descriptions. Architecture and design rationale are fine.
+
+        ## Commit and PR conventions
+
+        - Branch names are `<type>/<description>`. Slashes are the convention
+          across this org; do not flag them.
+        - Conventional commits, subject ≤ 50 chars, imperative mood, no period.
+        - One logical change per commit and per PR.
+        - `Co-Authored-By` trailers naming the assistant are required in this
+          org, not forbidden. Do not flag them.
+        - **Do not ask for a version bump.** `VERSION` and `package.json`'s
+          `version` must agree, and a bump opens a release cycle rather than
+          accompanying each PR: CI walks the `+N` revision on every merge.
+        - PR descriptions: no checkboxes. Report what was actually verified.
+
+        ## What NOT to flag
+
+        - The flush thresholds and buffer ceiling in `src/flush-buffer.ts` and
+          `src/writer/client.ts` — measured, not guessed.
+        - Defaults sized for a single-board computer running the whole Signal K
+          stack. Do not suggest raising a worker count or memory ceiling to what
+          a server would use.
+        - The absence of an index on the hot store's `sample` table. Nothing
+          reads it by key, and an index would cost the write budget the design
+          is judged on.
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - AGENTS.md

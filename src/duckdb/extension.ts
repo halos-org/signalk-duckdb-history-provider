@@ -13,6 +13,7 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { syncDirectory } from "../durable-write.js";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import {
@@ -21,6 +22,7 @@ import {
   currentDuckdbPlatform,
   duckdbVersionFromPackageVersion,
 } from "./duckdb-version.js";
+import { sqlLiteral } from "./sql.js";
 
 /**
  * Base DuckDB settings for every instance this package creates.
@@ -28,10 +30,8 @@ import {
  * Both flags are security settings, not conveniences: with autoload on, a
  * query naming an unknown function makes DuckDB fetch a binary from the
  * internet and run it, at query time, in a process that holds the vessel's
- * history. Restricting file access and locking the configuration after
- * startup is the other half, and belongs with the query layer that knows
- * which directories are legitimate:
- * https://github.com/halos-org/halos/issues/166
+ * history. `lockDownFileAccess` below is the other half of that, and runs
+ * once everything legitimate is open.
  */
 export const BASE_DUCKDB_CONFIG: Readonly<Record<string, string>> =
   Object.freeze({
@@ -251,20 +251,6 @@ function sweepStaleTemporaries(directory: string, own: string): void {
   }
 }
 
-function syncDirectory(directory: string): void {
-  try {
-    const fd = openSync(directory, "r");
-    try {
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    // Not every platform allows fsync on a directory handle. The device target
-    // is Linux, where it works and where it is what makes the rename durable.
-  }
-}
-
 /** Minimal shape of what `DuckDBConnection` offers us, so this module stays
  * out of the plugin's import graph — see src/test/plugin-import-graph.test.ts. */
 export interface Runnable {
@@ -279,6 +265,35 @@ export async function loadSqliteScanner(
   const path = ensureExtensionExtracted(options);
   // A single-quoted literal: the path is ours (package root plus configured
   // cache directory), and DuckDB has no parameter binding for LOAD.
-  await connection.run(`LOAD '${path.replaceAll("'", "''")}'`);
+  await connection.run(`LOAD '${sqlLiteral(path)}'`);
   return path;
+}
+
+/**
+ * Confine the engine to `directories` and freeze its configuration.
+ *
+ * **`allowed_directories` on its own does nothing.** Measured against DuckDB
+ * 1.5.5: with external access left enabled, a file outside the list is read
+ * happily. `enable_external_access = false` is what turns the list into an
+ * allowlist rather than a decoration — after both, a path outside it fails
+ * with "file system operations are disabled by configuration", `INSTALL`
+ * cannot reach its extension repository, and an `https://` URL is refused.
+ *
+ * Directories are prefix-matched, so the data directory covers the tree's
+ * dated sub-directories, the sidecar, the hot store's WAL and shm files, the
+ * expanded extension cache and the spill directory — including the dated
+ * directories that do not exist yet when this runs.
+ *
+ * **Everything legitimate must already be open.** The extension has to be
+ * loaded and the hot store attached before this call; an attached database
+ * keeps working afterwards, and a `LOAD` afterwards would not.
+ */
+export async function lockDownFileAccess(
+  connection: Runnable,
+  directories: string[],
+): Promise<void> {
+  const list = directories.map((dir) => `'${sqlLiteral(dir)}'`).join(", ");
+  await connection.run(`SET allowed_directories = [${list}]`);
+  await connection.run("SET enable_external_access = false");
+  await connection.run("SET lock_configuration = true");
 }

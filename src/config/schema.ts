@@ -1,4 +1,5 @@
 import { Type, Static } from "typebox";
+import { dividesTheDay } from "../roll/schedule.js";
 
 /**
  * The single source of truth for both the JSON schema the Signal K Admin UI
@@ -56,6 +57,25 @@ export const ConfigSchema = Type.Object({
       "The same bound for vessel contexts. Only relevant when other vessels are recorded.",
   }),
 
+  flushIntervalMs: Type.Number({
+    default: 5000,
+    title: "Flush interval (ms)",
+    description:
+      "No sample waits longer than this before being sent to the writer. This is also the crash-loss window: a hard power cut loses at most this much.",
+  }),
+  flushBatchSize: Type.Number({
+    default: 1000,
+    title: "Flush batch size (samples)",
+    description:
+      "Samples per write. Reaching it flushes early, whatever the interval says. Each batch is one SQLite transaction.",
+  }),
+  maxBufferMB: Type.Number({
+    default: 8,
+    title: "Buffer ceiling while the writer is unreachable (MB)",
+    description:
+      "Memory held for samples that could not be sent. When it is full the oldest are dropped, and the count is reported in the plugin status.",
+  }),
+
   dataDir: Type.String({
     default: "",
     title: "Data directory",
@@ -66,13 +86,22 @@ export const ConfigSchema = Type.Object({
   retentionDays: Type.Number({
     default: 0,
     title: "Retention (days, 0 = keep forever)",
+    description:
+      "A bound on what is stored, not a promise that everything older is deleted. Whole UTC days are dropped once the window has passed them, so the oldest sample kept can be up to a day older than the boundary. Applied after each roll.",
   }),
 
   rollIntervalMinutes: Type.Number({
-    default: 60,
+    default: 5,
     title: "Roll interval (minutes)",
     description:
-      "How often the hot store is rolled into the Parquet tree and truncated. Shorter keeps the hot store small and costs more Parquet files; longer does the reverse.",
+      "How often the hot store is rolled into the Parquet tree and truncated. Shorter keeps the hot store small and costs more Parquet files; longer does the reverse. Must divide 1440 — the schedule runs every N minutes from UTC midnight — and anything else falls back to the default.",
+  }),
+
+  compactHourly: Type.Boolean({
+    default: true,
+    title: "Compact each completed hour",
+    description:
+      "Merge an hour's roll files into one file sorted by path, once the hour is complete. Costs a short-lived process an hour and gives back both storage and query time. It does nothing at a roll interval of 60 minutes or more, where an hour already holds one file. Turning it off stops future merges and does not undo past ones.",
   }),
 });
 
@@ -88,9 +117,13 @@ export const CONFIG_DEFAULTS = {
   recordOthers: false,
   maxRecordedPaths: 2000,
   maxRecordedContexts: 100,
+  flushIntervalMs: 5000,
+  flushBatchSize: 1000,
+  maxBufferMB: 8,
   dataDir: "",
   retentionDays: 0,
-  rollIntervalMinutes: 60,
+  rollIntervalMinutes: 5,
+  compactHourly: true,
 };
 
 /**
@@ -141,27 +174,56 @@ export function normalizeConfig(config: StoredConfig): Config {
     // A missing toggle takes the schema default; an explicit false is honoured.
     recordSelf: config.recordSelf ?? CONFIG_DEFAULTS.recordSelf,
     recordOthers: config.recordOthers ?? CONFIG_DEFAULTS.recordOthers,
-    maxRecordedPaths: positive(
+    compactHourly: config.compactHourly ?? CONFIG_DEFAULTS.compactHourly,
+    maxRecordedPaths: positiveInteger(
       config.maxRecordedPaths,
       CONFIG_DEFAULTS.maxRecordedPaths,
     ),
-    maxRecordedContexts: positive(
+    maxRecordedContexts: positiveInteger(
       config.maxRecordedContexts,
       CONFIG_DEFAULTS.maxRecordedContexts,
     ),
+    flushIntervalMs: positive(
+      config.flushIntervalMs,
+      CONFIG_DEFAULTS.flushIntervalMs,
+    ),
+    flushBatchSize: positiveInteger(
+      config.flushBatchSize,
+      CONFIG_DEFAULTS.flushBatchSize,
+    ),
+    maxBufferMB: positive(config.maxBufferMB, CONFIG_DEFAULTS.maxBufferMB),
     dataDir:
       typeof config.dataDir === "string"
         ? config.dataDir
         : CONFIG_DEFAULTS.dataDir,
-    retentionDays: nonNegative(
-      config.retentionDays,
-      CONFIG_DEFAULTS.retentionDays,
+    // Floored, because expiry drops whole UTC days and half a day is not one
+    // of them. A number field in the Admin UI accepts 0.5 quite happily, and
+    // the rounding has to be visible in one place rather than inside the roll.
+    retentionDays: Math.floor(
+      nonNegative(config.retentionDays, CONFIG_DEFAULTS.retentionDays),
     ),
-    rollIntervalMinutes: positive(
+    rollIntervalMinutes: dayDivisor(
       config.rollIntervalMinutes,
       CONFIG_DEFAULTS.rollIntervalMinutes,
     ),
   };
+}
+
+/**
+ * A whole number of minutes that divides the day.
+ *
+ * The schedule is "every N minutes from UTC midnight", which only describes a
+ * cadence when N divides 1,440 — at 100 minutes the last slot before midnight
+ * is 40 minutes long, and whether the schedule drifts or jumps there is an
+ * accident of the arithmetic rather than anything an operator chose.
+ *
+ * It is not what keeps a roll inside one date directory. The roll places each
+ * row by its own timestamp, so a window spanning midnight writes into two
+ * directories and stays correct.
+ */
+function dayDivisor(value: number | undefined, fallback: number): number {
+  const positiveValue = positive(value, fallback);
+  return dividesTheDay(positiveValue) ? positiveValue : fallback;
 }
 
 function stringArray(value: unknown): string[] {
@@ -185,6 +247,20 @@ function numberRecord(value: unknown): Record<string, number> {
         entry[1] > 0,
     ),
   );
+}
+
+/**
+ * A count, rounded down, never below one.
+ *
+ * `Array.prototype.splice` applies ToIntegerOrInfinity to its delete count, so
+ * a batch size of 0.5 removes nothing while `isDue` still reports a full
+ * batch: the buffer never drains, grows to its ceiling and starts evicting,
+ * with the plugin reporting "Recording" throughout. A number field in the
+ * Admin UI accepts 0.5 quite happily.
+ */
+function positiveInteger(value: number | undefined, fallback: number): number {
+  const positiveValue = positive(value, fallback);
+  return Math.max(1, Math.floor(positiveValue));
 }
 
 function positive(value: number | undefined, fallback: number): number {
