@@ -156,6 +156,12 @@ describe("delivery", () => {
 
     for (let i = 1; i <= 6; i++) client.add(sample({ ts: i }));
     await eventually(() => store.rowCount() === 6, "all six samples");
+    // Same round-trip gap as above: the counter is waited for, not read off
+    // the row count.
+    await eventually(
+      () => client!.stats.acked === 3,
+      "the third acknowledgement",
+    );
     assert.strictEqual(client.stats.acked, 3, "three batches of two");
   });
 });
