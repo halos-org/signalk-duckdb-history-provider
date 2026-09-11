@@ -1,4 +1,5 @@
 import { describe, it } from "node:test";
+import { eventually } from "./fixtures.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import {
@@ -78,19 +79,6 @@ function storedRows(storePath: string): Record<string, unknown>[] {
     return [];
   } finally {
     db.close();
-  }
-}
-
-async function eventually(
-  check: () => boolean,
-  what: string,
-  timeoutMs = 20_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    if (check()) return;
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
 

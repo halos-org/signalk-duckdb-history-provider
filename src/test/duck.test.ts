@@ -268,7 +268,9 @@ describe("a query that fails", () => {
     // wrong request and kills the wrong process.
     let started = 0;
     const runner = make({
-      timeoutMs: 120,
+      // Long enough for the replacement, a real node process, to start and
+      // answer beside other suites.
+      timeoutMs: 2_000,
       spawnQuery: () => {
         started += 1;
         return started === 1
