@@ -18,7 +18,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # None of these jobs runs an authenticated git operation, and each
           # one then packs this workspace or mounts it into a container. The
