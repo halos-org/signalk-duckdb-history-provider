@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
-import { sample } from "./fixtures.js";
+import { eventually, sample } from "./fixtures.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,20 +11,6 @@ import { FlushBuffer } from "../flush-buffer.js";
 import { HotStore } from "../writer/hot-store.js";
 import { WriterServer } from "../writer/server.js";
 import { WriterClient } from "../writer/client.js";
-
-/** Polls until `check` holds, so tests never depend on a fixed sleep. */
-async function eventually(
-  check: () => boolean,
-  what: string,
-  timeoutMs = 5000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    if (check()) return;
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
 
 /**
  * Forwards between a client and the writer, swallowing the first
