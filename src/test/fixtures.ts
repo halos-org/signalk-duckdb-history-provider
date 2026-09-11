@@ -92,11 +92,15 @@ export function fat(bytes: number, over: Common = {}): Sample {
  *
  * Rejects rather than resolving on timeout: a helper that gave up quietly
  * would turn every timing assertion into one that cannot fail.
+ *
+ * The deadline bounds a failing test; it does not time a passing one. The
+ * longest waits here are for a query service to start, which takes 2-4 s on
+ * an idle machine and several times that beside other suites.
  */
 export async function eventually(
   check: () => boolean,
   what: string,
-  timeoutMs = 5000,
+  timeoutMs = 30_000,
   pollMs = 5,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
