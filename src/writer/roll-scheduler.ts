@@ -104,11 +104,6 @@ export interface RollSchedulerOptions {
   spawnRoll?: (args: string[]) => ChildProcess;
   /** Injected in tests, so a compaction need not be a real DuckDB process. */
   spawnCompact?: (args: string[]) => ChildProcess;
-  /**
-   * Merge each completed hour's rolls into one file sorted by path. Off makes
-   * the tree exactly what it was before compaction existed.
-   */
-  compactHourly?: boolean;
   /** Injected in tests. Production waits ROLL_TIMEOUT_MS. */
   timeoutMs?: number;
   /** Injected in tests. Production waits START_ROLL_DELAY_MS. */
@@ -408,7 +403,6 @@ export class RollScheduler {
    * so there is nothing here that can cost recording.
    */
   private async compactClosedHour(slot: number): Promise<void> {
-    if (this.options.compactHourly === false) return;
     if (this.stopped) return;
     // An hour holds at most one roll at this interval, and one file is not
     // worth rewriting under a second name. Checked before the spawn, because

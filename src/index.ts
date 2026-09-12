@@ -136,7 +136,6 @@ export default (app: App) => {
     dataDir: string,
     rollIntervalMinutes: number,
     retentionDays: number,
-    compactHourly: boolean,
   ): ChildProcess {
     // An argument array, never a shell: a data directory an operator typed
     // into the Admin UI would otherwise be a command line.
@@ -156,7 +155,6 @@ export default (app: App) => {
         String(rollIntervalMinutes),
         "--retention-days",
         String(retentionDays),
-        ...(compactHourly ? [] : ["--no-compact"]),
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
@@ -201,12 +199,7 @@ export default (app: App) => {
           );
           const timer = setTimeout(() => {
             if (!stopping && writer === null) {
-              writer = spawnWriter(
-                dataDir,
-                rollIntervalMinutes,
-                retentionDays,
-                compactHourly,
-              );
+              writer = spawnWriter(dataDir, rollIntervalMinutes, retentionDays);
             }
           }, delay);
           timer.unref();
@@ -299,7 +292,6 @@ export default (app: App) => {
           dataDir,
           config.rollIntervalMinutes,
           config.retentionDays,
-          config.compactHourly,
         );
 
         const buffer = new FlushBuffer({
