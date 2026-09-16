@@ -53,7 +53,7 @@ async function main(): Promise<void> {
   if (dataDir === undefined || dataDir === "") {
     writeStderr(
       "usage: writer/main.js --data-dir <path> --roll-interval-minutes <n> " +
-        "[--retention-days <n>] [--no-compact]\n",
+        "[--retention-days <n>]\n",
     );
     process.exit(1);
   }
@@ -115,20 +115,12 @@ async function main(): Promise<void> {
   }
   // Informational only. Nothing decides anything from it -- see writerPaths.
   writeFileSync(paths.pidFile, `${process.pid}\n`, { mode: 0o600 });
-  // The settings this process was actually given, not the ones the Admin UI
-  // shows. They arrive as arguments, and a flag the plugin and this side spell
-  // differently would otherwise mean silently keeping everything for ever.
-  // Present-means-off, like --replace on the roll: the plugin passes the flag
-  // only when an operator turned compaction off, so a writer started by an
-  // older plugin compacts, which is the default.
-  const compactHourly = !process.argv.includes("--no-compact");
-  // What will happen, not what was passed. An hour holds at most one roll at
-  // an interval of 60 minutes or more, so the scheduler merges nothing there
-  // whatever the flag says -- and a line reporting the flag would tell exactly
-  // the devices that get no merge that they are being merged.
-  const compaction = !compactHourly
-    ? "not compacting: turned off"
-    : rollIntervalMinutes >= 60
+  // What will happen, not what was configured. An hour holds at most one roll at
+  // an interval of 60 minutes or more, so the scheduler merges nothing there --
+  // and a line reporting the merge as on would tell exactly the devices that
+  // get no merge that they are being merged.
+  const compaction =
+    rollIntervalMinutes >= 60
       ? `not compacting: a ${rollIntervalMinutes}-minute roll already fills an hour`
       : "compacting each completed hour";
   process.stdout.write(
@@ -145,7 +137,6 @@ async function main(): Promise<void> {
     dataDir,
     intervalMinutes: rollIntervalMinutes,
     retentionDays: retentionUsable,
-    compactHourly,
     log: (line) => process.stdout.write(`${line}\n`),
     // stderr, because the plugin routes it to app.error while stdout goes to
     // app.debug. A roll failure nobody sees is the shape this whole design

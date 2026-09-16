@@ -770,9 +770,8 @@ describe(
  *
  * Every test here drives it through `spawnCompact`, which exists for exactly
  * this and which nothing used. The point is not that the merge works — that is
- * `compact.test.ts` — but that the scheduler reaches it at all, reaches it once
- * per hour, does not reach it when an operator turned it off, and reports what
- * it says.
+ * `compact.test.ts` — but that the scheduler triggers it when it should and
+ * skips it when it should not.
  */
 describe("compaction, scheduled", () => {
   const FIVE = { intervalMinutes: 5 };
@@ -783,13 +782,6 @@ describe("compaction, scheduled", () => {
 
     assert.deepEqual(hoursMerged(), [SLOT - 3_600_000]);
     assert.match(logged.join("\n"), /compacted the hour starting/);
-  });
-
-  it("merges nothing when an operator turned it off", async () => {
-    record(sample({ ts: AUG_23 }));
-    await scheduler({ ...FIVE, compactHourly: false }).rollOnce(SLOT);
-
-    assert.deepEqual(compactions, []);
   });
 
   it("moves on to the next hour once a roll closes one", async () => {

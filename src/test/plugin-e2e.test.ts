@@ -133,33 +133,28 @@ describe("a delta reaching the writer's store", () => {
   });
 
   /**
-   * Every one of these crosses a process boundary as a command-line flag, so a
-   * name the two sides spell differently would mean rolling on the default,
-   * keeping everything for ever, or compacting a tree an operator asked to
-   * leave alone — with nothing failing anywhere. The writer reports back what
-   * it was actually given, which is the only place the two spellings meet.
+   * These settings cross a process boundary as command-line flags, so a name
+   * the two sides spell differently would mean rolling on the default or
+   * keeping everything for ever — with nothing failing anywhere. The writer
+   * reports back what it was actually given, which is the only place the two
+   * spellings meet. Compaction always runs and is no longer a flag; the roll
+   * interval alone decides whether an hour holds more than one file to merge,
+   * so the writer's compaction line is derived from the interval it received.
    */
-  for (const { compactHourly, interval, expected } of [
+  for (const { interval, expected } of [
     {
-      compactHourly: true,
       interval: 30,
       expected: "compacting each completed hour",
     },
+    // The merge still cannot run: an hour holds one roll at this interval.
+    // Reporting it as on here would tell exactly the devices that get no merge
+    // that they are being merged.
     {
-      compactHourly: false,
-      interval: 30,
-      expected: "not compacting: turned off",
-    },
-    // The flag is on and the merge still cannot run: an hour holds one roll at
-    // this interval. Reporting the flag here would tell exactly the devices
-    // that get no merge that they are being merged.
-    {
-      compactHourly: true,
       interval: 60,
       expected: "not compacting: a 60-minute roll already fills an hour",
     },
   ]) {
-    it(`reports the writer's effective compaction at ${interval} minutes with the flag ${compactHourly ? "on" : "off"}`, async () => {
+    it(`reports the writer's effective compaction at ${interval} minutes`, async () => {
       const base = mkdtempSync(join(tmpdir(), "sk-parquet-e2e-"));
       const paths = writerPaths(base);
       const { app, calls } = stubApp(base);
@@ -168,7 +163,6 @@ describe("a delta reaching the writer's store", () => {
         plugin.start({
           rollIntervalMinutes: interval,
           retentionDays: 14,
-          compactHourly,
         });
 
         // The writer prints its ready line and the effective configuration

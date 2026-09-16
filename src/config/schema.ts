@@ -96,13 +96,6 @@ export const ConfigSchema = Type.Object({
     description:
       "How often the hot store is rolled into the Parquet tree and truncated. Shorter keeps the hot store small and costs more Parquet files; longer does the reverse. Must divide 1440 — the schedule runs every N minutes from UTC midnight — and anything else falls back to the default.",
   }),
-
-  compactHourly: Type.Boolean({
-    default: true,
-    title: "Compact each completed hour",
-    description:
-      "Merge an hour's roll files into one file sorted by path, once the hour is complete. Costs a short-lived process an hour and gives back both storage and query time. It does nothing at a roll interval of 60 minutes or more, where an hour already holds one file. Turning it off stops future merges and does not undo past ones.",
-  }),
 });
 
 export type Config = Static<typeof ConfigSchema>;
@@ -123,7 +116,6 @@ export const CONFIG_DEFAULTS = {
   dataDir: "",
   retentionDays: 0,
   rollIntervalMinutes: 5,
-  compactHourly: true,
 };
 
 /**
@@ -174,7 +166,6 @@ export function normalizeConfig(config: StoredConfig): Config {
     // A missing toggle takes the schema default; an explicit false is honoured.
     recordSelf: config.recordSelf ?? CONFIG_DEFAULTS.recordSelf,
     recordOthers: config.recordOthers ?? CONFIG_DEFAULTS.recordOthers,
-    compactHourly: config.compactHourly ?? CONFIG_DEFAULTS.compactHourly,
     maxRecordedPaths: positiveInteger(
       config.maxRecordedPaths,
       CONFIG_DEFAULTS.maxRecordedPaths,

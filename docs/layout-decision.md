@@ -329,10 +329,6 @@ Three properties make it safe to run over the only copy of the data:
   the id outright and the rows stay in the hot store, which is this package's
   preferred failure.
 
-Turning it off stops future merges and undoes none: hours already merged keep
-their `hour-<ms>.parquet`, and later hours stay as the rolls wrote them. The
-switch is `compactHourly` in the plugin config, `--no-compact` on the writer.
-
 ## The sidecar: yes
 
 Each roll writes one extra file holding the last value of every
