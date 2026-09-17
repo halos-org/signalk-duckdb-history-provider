@@ -3,7 +3,6 @@ dist/
 *.tsbuildinfo
 .DS_Store
 *.log
-package-lock.json
 
 # DuckDB extension binaries, ~8 MB compressed each. Fetched by
 # `./run fetch-extensions` and by prepublishOnly, never committed: the set is

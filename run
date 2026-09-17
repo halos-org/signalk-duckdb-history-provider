@@ -45,7 +45,7 @@ function format {
 function ci {
   #@ Everything CI runs, in CI's order
   #@ Category: Testing
-  if [ -f package-lock.json ]; then npm ci; else npm install; fi
+  npm ci
   npm run ci-lint
   npm run build:all
 }
@@ -221,12 +221,8 @@ PROBE
   if [[ "$npm_os" == linux ]]; then
     if [[ "$target_musl" == true ]]; then npmflags+=(--libc=musl); else npmflags+=(--libc=glibc); fi
   fi
-  if [[ -f package-lock.json ]]; then
-    cp package-lock.json "$stage/"
-    (cd "$stage" && npm ci "${npmflags[@]}")
-  else
-    (cd "$stage" && npm install "${npmflags[@]}")
-  fi
+  cp package-lock.json "$stage/"
+  (cd "$stage" && npm ci "${npmflags[@]}")
 
   local binding="@duckdb/node-bindings-${npm_os}-${npm_cpu}"
   if [[ "$npm_os" == linux && "$target_musl" == true ]]; then
