@@ -44,11 +44,11 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
-          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+          cache: npm
 
       - name: Build and fetch the extension
         run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm ci
           npm run build
           node tools/fetch-extensions.mjs ${{ matrix.platform }}
 

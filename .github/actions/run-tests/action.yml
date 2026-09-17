@@ -14,14 +14,10 @@ runs:
       uses: actions/setup-node@v4
       with:
         node-version: "24"
-        cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+        cache: npm
 
     - name: Install dependencies
-      # package-lock.json is gitignored in this repo, so `npm ci` has nothing to
-      # read on a clean checkout. Use it when a lockfile is present (reproducible
-      # and faster) and fall back otherwise.
-      run: |
-        if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      run: npm ci
       shell: bash
 
     - name: Lint and format check

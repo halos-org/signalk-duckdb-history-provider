@@ -46,11 +46,11 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+          cache: npm
 
       - name: Build and pack the plugin
         run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm ci
           npm run build
           # extensions/ is gitignored and downloaded, so a checkout has none.
           # `prepublishOnly` fetches them for a real publish, but npm does not
