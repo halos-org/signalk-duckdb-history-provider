@@ -1,14 +1,23 @@
-name: Pull Request Checks
+name: PR checks
 
+# No branch filter: a PR stacked on another branch gets checked before it is
+# retargeted to main.
 on:
   pull_request:
-    branches: [main]
-
-permissions:
-  contents: read
 
 jobs:
   checks:
-    uses: halos-org/shared-workflows/.github/workflows/pr-checks.yml@main
-    with:
-      skip-lintian: true
+    uses: halos-org/shared-workflows/.github/workflows/checks.yml@v1.0.0-rc.1
+
+  # Branch protection requires only this job. List every other job in needs,
+  # including jobs defined in this file.
+  status:
+    needs: [checks]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require every job to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$NEEDS"
