@@ -59,11 +59,15 @@ a check on module evaluation alone.
 - `src/index.ts` — the plugin the server loads. Subscribes to the delta bus,
   spawns the writer process, and reports what is happening in the status line.
 - `src/recorder.ts` — the whole of the Signal K process's involvement: path
-  filter, rate cap, cardinality cap, and a sample handed onwards.
+  filter, rate cap, cardinality cap, and a delta's samples handed onwards.
 - `src/flush-buffer.ts` — what is held between flushes. Bounded in **bytes**,
   not elements, and the bytes are measured by serialising rather than
   estimated, because JSON escaping can expand a value sixfold and an estimate
-  below the truth makes the ceiling fictional.
+  below the truth makes the ceiling fictional. **Its unit is a delta**, not a
+  sample: an object delta is one sample per field and a batch is one
+  transaction, so a batch boundary, an eviction or a refusal inside a delta
+  would store or expose half an object. Every limit takes, evicts or refuses a
+  delta whole.
 - `src/writer/` — the writer process and the socket to it. `main.ts` is its
   entry point and must never be imported by the plugin; `contract.ts` holds the
   exit codes and paths both sides need, which is why it exists at all.
@@ -75,10 +79,26 @@ a check on module evaluation alone.
 - `src/data-dir.ts` — resolves the configured directory once, in the plugin,
   because the spawned processes do not share the server's working directory.
 - `src/delta-routing.ts` — copied from `signalk-questdb-history-provider` with
-  its suite. Routing behaviour is identical and must stay that way: it decides
-  what a position query returns, and Unit 4c reproduces that provider's history
-  contract. Only the comments were retargeted, from its three QuestDB tables to
-  this store's `value_kind` column. Fix bugs in both.
+  its suite. Its routing behaviour matches the sibling's
+  `src/ingestion/recorder.ts` and must stay that way: it decides what a
+  position query returns, and Unit 4c reproduces that provider's history
+  contract. The code is not identical — it names object fields through
+  `src/pointer.ts` and its comments describe this store's `value_kind` column —
+  so compare behaviour, not text. Fix bugs in both.
+- `src/pointer.ts` — how an object's fields are named in storage, `P#/k` with
+  the key escaped per RFC 6901, and how they are put back together. The same
+  encoding as the sibling's `src/storage/pointer.ts`. Object values follow
+  [halos-org/halos#185](https://github.com/halos-org/halos/issues/185): gated
+  on P, stored one row per field with one `ts`, read back as one object per
+  delta or per bucket. Two differences from the sibling are deliberate. **The
+  path cap exists only here**, and it counts P once. **This store keeps whole
+  milliseconds**, where the sibling steps each delta a microsecond apart, so two
+  deltas from one source stamped in one millisecond read back as one delta;
+  that is accepted, and there is no arrival-order (`seq`) column to separate
+  them. Nor does this reader bound object reads below the newest `ts` the way
+  the sibling does: QuestDB can commit part of one write, while here a delta
+  is one batch, one batch is one SQLite transaction, and the roll and the
+  truncate both cut on a rowid read between transactions.
 - `src/path-matcher.ts`, `src/time-range.ts` — copied from
   `signalk-questdb-history-provider` with their suites. Fix bugs in both.
   They currently **differ** from the sibling by three fixes: `resolveTimeRange`
