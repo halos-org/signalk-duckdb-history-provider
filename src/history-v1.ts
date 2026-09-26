@@ -1,3 +1,5 @@
+import { setField, splitPointerPath } from "./pointer.js";
+import type { ObjectValue } from "./pointer.js";
 import { QueryRunner, RANGE_COLUMNS } from "./query/duck.js";
 
 /**
@@ -131,6 +133,33 @@ function decodeValue(row: Row): unknown {
   }
 }
 
+/** One stored row, decoded, with an object's field split from its path. */
+interface Entry {
+  ts: number;
+  context: string;
+  source: string | null;
+  path: string;
+  /** Set when the row is one field of the object at `path`. */
+  field?: string;
+  kind: string | null;
+  value: unknown;
+}
+
+function toEntry(raw: unknown[]): Entry {
+  const row = toRow(raw);
+  const entry = {
+    ts: row.ts,
+    context: row.context,
+    source: row.source,
+    kind: row.kind,
+    value: decodeValue(row),
+  };
+  const pointer = splitPointerPath(row.path);
+  return pointer === null
+    ? { ...entry, path: row.path }
+    : { ...entry, path: pointer.path, field: pointer.key };
+}
+
 /**
  * Rows into the deltas they were recorded from.
  *
@@ -138,8 +167,12 @@ function decodeValue(row: Row): unknown {
  * would force a single `$source` label onto both, so each source gets its own
  * update — exactly how the live deltas arrived. Rows with no recorded source
  * group together and replay without a `$source`.
+ *
+ * An object's fields, stored one row each under `path#/key`, share their
+ * delta's `ts` and source, so within a group they become one value of the
+ * object's path again — the shape the delta arrived in.
  */
-function groupRowsIntoDeltas(rows: unknown[][]): Delta[] {
+function groupRowsIntoDeltas(entries: Entry[]): Delta[] {
   const byTimestamp = new Map<
     string,
     Map<
@@ -148,15 +181,15 @@ function groupRowsIntoDeltas(rows: unknown[][]): Delta[] {
         context: string;
         source?: string;
         values: { path: string; value: unknown }[];
+        objects: Map<string, ObjectValue>;
       }
     >
   >();
 
-  for (const raw of rows) {
-    const row = toRow(raw);
-    const timestamp = new Date(row.ts).toISOString();
-    const source = row.source ?? undefined;
-    const value = decodeValue(row);
+  for (const entry of entries) {
+    const timestamp = new Date(entry.ts).toISOString();
+    const source = entry.source ?? undefined;
+    const { value } = entry;
 
     let byGroup = byTimestamp.get(timestamp);
     if (byGroup === undefined) {
@@ -166,11 +199,32 @@ function groupRowsIntoDeltas(rows: unknown[][]): Delta[] {
     // A NUL byte can appear in neither a context nor a sourceRef, so the
     // composite key is unambiguous.
     const groupKey =
-      source === undefined ? row.context : `${row.context}\u0000${source}`;
+      source === undefined ? entry.context : `${entry.context}\u0000${source}`;
     let group = byGroup.get(groupKey);
     if (group === undefined) {
-      group = { context: row.context, source, values: [] };
+      group = {
+        context: entry.context,
+        source,
+        values: [],
+        objects: new Map(),
+      };
       byGroup.set(groupKey, group);
+    }
+    if (entry.field !== undefined) {
+      let object = group.objects.get(entry.path);
+      if (object === undefined) {
+        object = {};
+        group.objects.set(entry.path, object);
+        group.values.push({ path: entry.path, value: object });
+      }
+      if (
+        typeof value === "number" ||
+        typeof value === "string" ||
+        typeof value === "boolean"
+      ) {
+        setField(object, entry.field, value);
+      }
+      continue;
     }
     // Vessel identity is recorded under the synthetic path "name" tagged
     // `identity`, because it arrives as an empty-path object delta —
@@ -178,11 +232,11 @@ function groupRowsIntoDeltas(rows: unknown[][]): Delta[] {
     // names from. Replay it as it arrived. The kind gate keeps a data path
     // literally named "name" replaying as the plain string it is.
     group.values.push(
-      row.path === "name" &&
-        row.kind === "identity" &&
+      entry.path === "name" &&
+        entry.kind === "identity" &&
         typeof value === "string"
         ? { path: "", value: { name: value } }
-        : { path: row.path, value },
+        : { path: entry.path, value },
     );
   }
 
@@ -200,6 +254,32 @@ function groupRowsIntoDeltas(rows: unknown[][]): Delta[] {
     }
   }
   return deltas;
+}
+
+/**
+ * A snapshot's object fields, restamped so each object is one value.
+ *
+ * The snapshot holds each field's newest row, and an object's fields can come
+ * from different deltas — a field the latest delta did not carry keeps an
+ * older value. Every field of one `(context, path)` takes the timestamp and
+ * source of the newest among them, so grouping puts them back into one object.
+ */
+function stampObjectsWithNewest(entries: Entry[]): Entry[] {
+  const newest = new Map<string, Entry>();
+  const keyOf = (entry: Entry) => `${entry.context}\u0000${entry.path}`;
+  for (const entry of entries) {
+    if (entry.field === undefined) continue;
+    const held = newest.get(keyOf(entry));
+    if (held === undefined || entry.ts > held.ts)
+      newest.set(keyOf(entry), entry);
+  }
+  return entries.map((entry) => {
+    const stamp =
+      entry.field === undefined ? undefined : newest.get(keyOf(entry));
+    return stamp === undefined
+      ? entry
+      : { ...entry, ts: stamp.ts, source: stamp.source };
+  });
 }
 
 export function createHistoryProviderV1(
@@ -357,7 +437,31 @@ export function createHistoryProviderV1(
           return;
         }
 
-        const deltas = groupRowsIntoDeltas(answer.rows);
+        // A busy interval can hold more rows than one read returns — a live
+        // install already reaches ~6k rows in 60 s. Advancing to chunkEnd after
+        // a truncated read would skip the remainder silently, so the window is
+        // drained before moving on.
+        //
+        // The rows of the last millisecond on a truncated page are held back
+        // and the next read resumes AT that millisecond: the page may have cut
+        // it anywhere, and a delta — every field of an object, several paths
+        // an instrument stamped together — must arrive whole and once. Only
+        // when the whole page is one millisecond is there nothing to hold back
+        // by; then it is sent and the cursor steps past it by 1 ms, trading
+        // that millisecond's tail for guaranteed progress.
+        let rows = answer.rows.map(toEntry);
+        let resumeAt: number | null = null;
+        if (answer.truncated) {
+          const lastTs = rows[rows.length - 1].ts;
+          if (rows[0].ts < lastTs) {
+            rows = rows.filter((entry) => entry.ts < lastTs);
+            resumeAt = lastTs;
+          } else {
+            resumeAt = lastTs + 1;
+          }
+        }
+
+        const deltas = groupRowsIntoDeltas(rows);
         if (deltas.length > 0 && latestNames === null) {
           latestNames = await fetchLatestNames(startTime);
           if (stopped) return;
@@ -384,24 +488,7 @@ export function createHistoryProviderV1(
           spark.write({ ...delta, context });
         }
 
-        // A busy interval can hold more rows than one read returns — a live
-        // install already reaches ~6k rows in 60 s. Advancing to chunkEnd after
-        // a truncated read would skip the remainder silently, so drain the
-        // window before moving on.
-        //
-        // Resume AT the last sent row's timestamp, not past it: a single
-        // instrument update commonly stamps several paths within the same
-        // millisecond, and stepping past it would drop the siblings that did
-        // not fit in this page. Re-reading that millisecond can re-send rows
-        // already delivered, which is harmless on replay — losing them is not.
-        //
-        // Only when the whole page shared currentTime's millisecond (so
-        // resuming at it would repeat the identical read forever) does the
-        // cursor step forward by 1 ms, trading that millisecond's tail for
-        // guaranteed progress.
-        if (answer.truncated) {
-          const lastTs = toRow(answer.rows[answer.rows.length - 1]).ts;
-          const resumeAt = lastTs > currentTime ? lastTs : currentTime + 1;
+        if (resumeAt !== null) {
           currentTime = Math.min(resumeAt, chunkEnd);
           scheduleChunk(0);
           return;
@@ -466,7 +553,9 @@ export function createHistoryProviderV1(
       .run({ kind: "snapshot", at })
       .then((answer) => {
         callback(
-          groupRowsIntoDeltas(answer.rows).map((delta) => ({
+          groupRowsIntoDeltas(
+            stampObjectsWithNewest(answer.rows.map(toEntry)),
+          ).map((delta) => ({
             ...delta,
             context: onTheWire(delta.context),
           })),

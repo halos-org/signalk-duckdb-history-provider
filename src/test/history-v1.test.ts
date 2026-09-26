@@ -269,6 +269,49 @@ describe("getHistory", { skip: NO_BUNDLED_EXTENSION }, () => {
     assert.deepEqual(found.get(`${SELF}|`), { name: "Kaikki" });
   });
 
+  it("returns one object per object path, each field's newest value", async () => {
+    record(
+      sample({ ts: AUG_23, path: "navigation.attitude#/roll", value: 1 }),
+      sample({ ts: AUG_23, path: "navigation.attitude#/pitch", value: 1 }),
+      sample({ ts: AUG_23, path: "navigation.attitude#/yaw", value: 1 }),
+    );
+    record(
+      sample({
+        ts: AUG_23 + 1000,
+        source: "gps.1",
+        path: "navigation.attitude#/roll",
+        value: 2,
+      }),
+      sample({
+        ts: AUG_23 + 1000,
+        source: "gps.1",
+        path: "navigation.attitude#/pitch",
+        value: 2,
+      }),
+    );
+
+    const deltas = await snapshotAt(AUG_23 + 5000);
+
+    const attitude = deltas.filter((delta) =>
+      delta.updates[0].values.some((v) => v.path === "navigation.attitude"),
+    );
+    assert.equal(attitude.length, 1);
+    // Stamped with the newest field's row, and never a pointer name.
+    assert.deepEqual(attitude[0].updates, [
+      {
+        timestamp: new Date(AUG_23 + 1000).toISOString(),
+        $source: "gps.1",
+        values: [
+          { path: "navigation.attitude", value: { roll: 2, pitch: 2, yaw: 1 } },
+        ],
+      },
+    ]);
+    assert.ok(
+      !replayed(deltas).some(([path]) => path.includes("#")),
+      "a pointer name reached the snapshot",
+    );
+  });
+
   it("holds a path whose newest row is many rolls older than the instant", async () => {
     // What the sidecar is for: `quiet` last reported before two more rolls
     // happened, and its date directory is far outside the snapshot's scan
@@ -474,6 +517,62 @@ describe("streamHistory", { skip: NO_BUNDLED_EXTENSION }, () => {
     }
   });
 
+  it("replays an object's fields as one value of its path", async () => {
+    record(
+      sample({ ts: AUG_23, path: "navigation.attitude#/roll", value: 0.1 }),
+      sample({ ts: AUG_23, path: "navigation.attitude#/a~1b", value: 0.2 }),
+      sample({ ts: AUG_23, path: "a", value: 1 }),
+    );
+
+    const client = fakeSpark();
+    const stop = history.streamHistory(client.spark, ask(AUG_23), () => {});
+    try {
+      await eventually(() => client.writes.length >= 1, "the delta");
+      assert.deepEqual(replayed(client.writes), [
+        ["navigation.attitude", { roll: 0.1, "a/b": 0.2 }],
+        ["a", 1],
+      ]);
+    } finally {
+      stop();
+    }
+  });
+
+  it("never ends a truncated page inside a delta", async () => {
+    // 3334 three-field deltas are 10002 rows, so the first page of 10000 cuts
+    // the last delta after its first field.
+    const deltas = 3334;
+    const rows: Sample[] = [];
+    for (let i = 0; i < deltas; i += 1) {
+      for (const key of ["roll", "pitch", "yaw"]) {
+        rows.push(
+          sample({
+            ts: AUG_23 + i,
+            path: `navigation.attitude#/${key}`,
+            value: i,
+          }),
+        );
+      }
+    }
+    record(...rows);
+
+    const client = fakeSpark();
+    const stop = history.streamHistory(client.spark, ask(AUG_23), () => {});
+    try {
+      await eventually(
+        () => replayed(client.writes).length >= deltas,
+        "every delta",
+        30_000,
+      );
+      const values = replayed(client.writes).map(([, value]) => value);
+      assert.equal(values.length, deltas, "a delta was replayed twice");
+      for (const value of values) {
+        assert.equal(Object.keys(value as object).length, 3);
+      }
+    } finally {
+      stop();
+    }
+  });
+
   it("drains a window that holds more rows than one read returns", async () => {
     // A live install already reaches ~6k rows in a 60-second window. Advancing
     // to the end of the window after a truncated read would drop the rest of it
@@ -493,11 +592,12 @@ describe("streamHistory", { skip: NO_BUNDLED_EXTENSION }, () => {
         30_000,
       );
       const values = replayed(client.writes).map(([, value]) => value);
-      // Every sample arrives, and in order. A resumed read may repeat the
-      // millisecond it resumed at, which is harmless on replay, so this checks
-      // coverage rather than an exact count.
-      assert.equal(new Set(values).size, 10_500);
-      assert.equal(values[0], 0);
+      // Every sample arrives once, and in order: a truncated page holds back
+      // its last millisecond rather than sending it twice.
+      assert.deepEqual(
+        values,
+        rows.map((row) => row.value),
+      );
     } finally {
       stop();
     }
