@@ -12,18 +12,23 @@ const OTHER = "vessels.urn:mrn:imo:mmsi:244813000";
 /** A recorder plus the samples it emitted and the lines it logged. */
 function build(config: StoredConfig = {}, startAt = 0) {
   const samples: Sample[] = [];
+  const deltas: (readonly Sample[])[] = [];
   const lines: string[] = [];
   let clock = startAt;
   const recorder = new Recorder({
     config: normalizeConfig(config),
     selfContext: SELF,
-    emit: (sample) => samples.push(sample),
+    emit: (delta) => {
+      deltas.push(delta);
+      samples.push(...delta);
+    },
     now: () => clock,
     log: (line) => lines.push(line),
   });
   return {
     recorder,
     samples,
+    deltas,
     lines,
     at(ms: number) {
       clock = ms;
@@ -103,6 +108,22 @@ describe("what reaches the writer", () => {
         [1_000, "navigation.attitude#/roll", 0.02],
         [1_000, "navigation.attitude#/pitch", -0.01],
         [1_000, "navigation.attitude#/yaw", 1.57],
+      ],
+    );
+  });
+
+  it("hands an object's fields onwards together, as one delta", () => {
+    // The flush buffer keeps what it is handed together, so a batch boundary
+    // or an eviction never stores part of an object.
+    const t = build({ defaultSamplingRate: 0 });
+    t.feed({ path: "navigation.attitude", value: { roll: 0.02, yaw: 1.57 } });
+    t.feed();
+
+    assert.deepStrictEqual(
+      t.deltas.map((d) => d.map((s) => s.path)),
+      [
+        ["navigation.attitude#/roll", "navigation.attitude#/yaw"],
+        ["environment.depth.belowKeel"],
       ],
     );
   });

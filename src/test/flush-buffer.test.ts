@@ -18,16 +18,16 @@ describe("flushing on whichever comes first", () => {
   it("is due once the batch threshold is reached, before any time passes", () => {
     const buf = buffer({ batchSize: 3 });
 
-    buf.add(sample(), 1000);
-    buf.add(sample(), 1000);
+    buf.add([sample()], 1000);
+    buf.add([sample()], 1000);
     assert.strictEqual(buf.isDue(1000), false, "two of three is not a batch");
-    buf.add(sample(), 1000);
+    buf.add([sample()], 1000);
     assert.strictEqual(buf.isDue(1000), true);
   });
 
   it("is due once the interval has elapsed, below the threshold", () => {
     const buf = buffer({ batchSize: 1000, flushIntervalMs: 5000 });
-    buf.add(sample(), 0);
+    buf.add([sample()], 0);
 
     assert.strictEqual(buf.isDue(4999), false);
     assert.strictEqual(buf.isDue(5000), true);
@@ -45,7 +45,7 @@ describe("flushing on whichever comes first", () => {
     // clock anchored at construction would make the first flush after a long
     // idle period fire the instant a sample arrived.
     const buf = buffer({ flushIntervalMs: 5000 });
-    buf.add(sample(), 100_000);
+    buf.add([sample()], 100_000);
 
     assert.strictEqual(buf.isDue(104_999), false);
     assert.strictEqual(buf.isDue(105_000), true);
@@ -56,12 +56,15 @@ describe("flushing on whichever comes first", () => {
     // a batch. With a remainder that is itself a full batch, isDue would be
     // true for the threshold reason and say nothing about the clock.
     const buf = buffer({ flushIntervalMs: 5000, batchSize: 2 });
-    buf.add(sample({ ts: 1 }), 0);
-    buf.add(sample({ ts: 2 }), 0);
-    buf.add(sample({ ts: 3 }), 0);
+    buf.add([sample({ ts: 1 })], 0);
+    buf.add([sample({ ts: 2 })], 0);
+    buf.add([sample({ ts: 3 })], 0);
 
     assert.deepStrictEqual(
-      buf.take(1000).map((s) => s.ts),
+      buf
+        .take(1000)
+        .flat()
+        .map((s) => s.ts),
       [1, 2],
     );
     assert.strictEqual(buf.length, 1);
@@ -74,10 +77,13 @@ describe("flushing on whichever comes first", () => {
 
   it("takes at most one batch and leaves the rest buffered", () => {
     const buf = buffer({ batchSize: 2 });
-    for (let i = 0; i < 5; i++) buf.add(sample({ ts: i }), 0);
+    for (let i = 0; i < 5; i++) buf.add([sample({ ts: i })], 0);
 
     assert.deepStrictEqual(
-      buf.take(0).map((s) => s.ts),
+      buf
+        .take(0)
+        .flat()
+        .map((s) => s.ts),
       [0, 1],
       "oldest first",
     );
@@ -89,9 +95,12 @@ describe("flushing on whichever comes first", () => {
 describe("the ceiling is a byte budget", () => {
   it("drops the oldest samples when the budget is exceeded", () => {
     const buf = buffer({ maxBytes: 4 * 200, batchSize: 1000 });
-    for (let i = 0; i < 10; i++) buf.add(fat(100, { ts: i }), 0);
+    for (let i = 0; i < 10; i++) buf.add([fat(100, { ts: i })], 0);
 
-    const kept = buf.take(0).map((s) => s.ts);
+    const kept = buf
+      .take(0)
+      .flat()
+      .map((s) => s.ts);
     assert.ok(kept.length < 10, "some samples must have been dropped");
     assert.deepStrictEqual(
       kept,
@@ -111,7 +120,7 @@ describe("the ceiling is a byte budget", () => {
     // Structured samples are several times larger each, so a cap counted in
     // elements would hold several times the memory it was chosen for.
     const buf = buffer({ maxBytes: 10_000, batchSize: 1_000_000 });
-    for (let i = 0; i < 50; i++) buf.add(fat(1000), 0);
+    for (let i = 0; i < 50; i++) buf.add([fat(1000)], 0);
 
     assert.ok(
       buf.byteSize <= 10_000,
@@ -125,7 +134,7 @@ describe("the ceiling is a byte budget", () => {
     // element, and "drop the oldest" would then evict every later sample
     // forever to make room for something that never fits.
     const buf = buffer({ maxBytes: 500 });
-    buf.add(fat(5000), 0);
+    buf.add([fat(5000)], 0);
 
     assert.strictEqual(buf.length, 0);
     assert.strictEqual(buf.dropped, 1);
@@ -137,8 +146,8 @@ describe("the ceiling is a byte budget", () => {
     const one = sample({ ts: 1 });
     const two = sample({ kind: "string", value: "moored", ts: 2 });
 
-    buf.add(one, 0);
-    buf.add(two, 0);
+    buf.add([one], 0);
+    buf.add([two], 0);
 
     // Each entry carries its own separator, so the buffer accounts for what a
     // frame would cost rather than for the samples alone.
@@ -155,7 +164,7 @@ describe("the frame limit binds as well as the budget", () => {
     // sent: they reached the socket, encodeFrame refused them, and the whole
     // batch around them was discarded.
     const buf = buffer({ maxBytes: 8 * 1024 * 1024 });
-    buf.add(fat(5 * 1024 * 1024), 0);
+    buf.add([fat(5 * 1024 * 1024)], 0);
 
     assert.strictEqual(buf.length, 0);
     assert.strictEqual(buf.dropped, 1);
@@ -165,7 +174,7 @@ describe("the frame limit binds as well as the budget", () => {
     // batchSize is operator-editable with no upper bound, so count alone lets
     // a batch grow past what a frame can carry.
     const buf = buffer({ maxBytes: 64 * 1024 * 1024, batchSize: 1000 });
-    for (let i = 0; i < 8; i++) buf.add(fat(1024 * 1024, { ts: i }), 0);
+    for (let i = 0; i < 8; i++) buf.add([fat(1024 * 1024, { ts: i })], 0);
 
     const taken = buf.take(0);
     assert.ok(taken.length < 8, "the whole backlog was handed over at once");
@@ -173,7 +182,7 @@ describe("the frame limit binds as well as the budget", () => {
     // the accounting under test, so it agreed with a take() that ignored the
     // commas between array elements and let a 4,247,945-byte frame through.
     assert.doesNotThrow(() =>
-      encodeFrame({ type: "batch", seq: 1, samples: taken }),
+      encodeFrame({ type: "batch", seq: 1, samples: taken.flat() }),
     );
     assert.strictEqual(
       buf.length,
@@ -189,12 +198,12 @@ describe("the frame limit binds as well as the budget", () => {
     const buf = buffer({ maxBytes: 64 * 1024 * 1024, batchSize: 1_000_000 });
     const per = sampleBytes(sample());
     const enough = Math.ceil((MAX_FRAME_BYTES - 128) / per) + 10;
-    for (let i = 0; i < enough; i++) buf.add(sample(), 0);
+    for (let i = 0; i < enough; i++) buf.add([sample()], 0);
 
     const taken = buf.take(0);
     assert.ok(taken.length > 1000, "not enough samples to expose separators");
     assert.doesNotThrow(
-      () => encodeFrame({ type: "batch", seq: 1, samples: taken }),
+      () => encodeFrame({ type: "batch", seq: 1, samples: taken.flat() }),
       "take() produced a batch encodeFrame refuses",
     );
   });
@@ -203,8 +212,8 @@ describe("the frame limit binds as well as the budget", () => {
     // The byte bound must not stall: one sample at the ceiling has to go, or
     // nothing ever drains.
     const buf = buffer({ maxBytes: 8 * 1024 * 1024, batchSize: 1000 });
-    buf.add(fat(3 * 1024 * 1024), 0);
-    buf.add(fat(3 * 1024 * 1024), 0);
+    buf.add([fat(3 * 1024 * 1024)], 0);
+    buf.add([fat(3 * 1024 * 1024)], 0);
 
     assert.strictEqual(buf.take(0).length, 1);
     assert.strictEqual(buf.length, 1);
@@ -261,13 +270,16 @@ describe("sampleBytes", () => {
 describe("a batch that failed to send goes back where it came from", () => {
   it("requeues at the front, so ordering survives a failed send", () => {
     const buf = buffer({ batchSize: 2 });
-    for (let i = 0; i < 4; i++) buf.add(sample({ ts: i }), 0);
+    for (let i = 0; i < 4; i++) buf.add([sample({ ts: i })], 0);
 
     buf.requeue(buf.take(0));
 
     assert.strictEqual(buf.length, 4);
     assert.deepStrictEqual(
-      buf.take(0).map((s) => s.ts),
+      buf
+        .take(0)
+        .flat()
+        .map((s) => s.ts),
       [0, 1],
       "the retried batch is sent again before the newer samples",
     );
@@ -275,7 +287,7 @@ describe("a batch that failed to send goes back where it came from", () => {
 
   it("restores the byte accounting it removed", () => {
     const buf = buffer({ batchSize: 2 });
-    for (let i = 0; i < 4; i++) buf.add(sample({ ts: i }), 0);
+    for (let i = 0; i < 4; i++) buf.add([sample({ ts: i })], 0);
     const before = buf.byteSize;
 
     buf.requeue(buf.take(0));
@@ -287,7 +299,7 @@ describe("a batch that failed to send goes back where it came from", () => {
     // A retry has already waited its interval once. Making it wait again
     // would double the crash-loss window every time the writer blips.
     const buf = buffer({ flushIntervalMs: 5000, batchSize: 10 });
-    buf.add(sample(), 0);
+    buf.add([sample()], 0);
 
     buf.requeue(buf.take(5000));
 
@@ -299,17 +311,113 @@ describe("a batch that failed to send goes back where it came from", () => {
     // while the writer was unreachable drops the retry rather than the fresh
     // samples. For a live feed the newest are the ones worth keeping.
     const buf = buffer({ maxBytes: 3 * 200, batchSize: 2 });
-    buf.add(fat(100, { ts: 0 }), 0);
-    buf.add(fat(100, { ts: 1 }), 0);
+    buf.add([fat(100, { ts: 0 })], 0);
+    buf.add([fat(100, { ts: 1 })], 0);
     const taken = buf.take(0);
 
-    buf.add(fat(100, { ts: 2 }), 0);
-    buf.add(fat(100, { ts: 3 }), 0);
+    buf.add([fat(100, { ts: 2 })], 0);
+    buf.add([fat(100, { ts: 3 })], 0);
     buf.requeue(taken);
 
     assert.ok(buf.byteSize <= 3 * 200);
-    const kept = buf.take(0).map((s) => s.ts);
+    const kept = buf
+      .take(0)
+      .flat()
+      .map((s) => s.ts);
     assert.ok(!kept.includes(0), "the oldest retried sample was dropped first");
     assert.ok(buf.dropped > 0);
+  });
+});
+
+describe("a delta is the unit, never split or dropped in part", () => {
+  const delta = (ts: number, n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      sample({ ts, path: `navigation.attitude#/f${i}` }),
+    );
+
+  it("counts samples, not deltas, towards the batch size", () => {
+    const buf = buffer({ batchSize: 3 });
+    buf.add(delta(1, 3), 0);
+
+    assert.strictEqual(buf.length, 3);
+    assert.strictEqual(buf.isDue(0), true);
+  });
+
+  it("leaves a delta that would cross the batch size for the next batch", () => {
+    // Two batches are two transactions, and a reader between them would see
+    // half an object.
+    const buf = buffer({ batchSize: 3 });
+    buf.add(delta(1, 2), 0);
+    buf.add(delta(2, 2), 0);
+
+    assert.deepStrictEqual(
+      buf.take(0).map((d) => d.map((s) => s.ts)),
+      [[1, 1]],
+    );
+    assert.strictEqual(buf.length, 2);
+  });
+
+  it("hands over a delta larger than the batch size whole", () => {
+    const buf = buffer({ batchSize: 2 });
+    buf.add(delta(1, 3), 0);
+
+    assert.strictEqual(buf.take(0).flat().length, 3);
+    assert.strictEqual(buf.length, 0);
+  });
+
+  it("leaves a delta that would cross the frame budget for the next batch", () => {
+    const buf = buffer({ maxBytes: 64 * 1024 * 1024, batchSize: 1000 });
+    const big = (ts: number) => [
+      fat(1024 * 1024, { ts }),
+      fat(1024 * 1024, { ts }),
+    ];
+    buf.add(big(1), 0);
+    buf.add(big(2), 0);
+
+    const taken = buf.take(0);
+    assert.deepStrictEqual(
+      taken.map((d) => d.length),
+      [2],
+    );
+    assert.doesNotThrow(() =>
+      encodeFrame({ type: "batch", seq: 1, samples: taken.flat() }),
+    );
+  });
+
+  it("evicts whole deltas to stay under the budget", () => {
+    const buf = buffer({ maxBytes: 3 * 200, batchSize: 1000 });
+    buf.add([fat(100, { ts: 0 }), fat(100, { ts: 0 })], 0);
+    buf.add([fat(100, { ts: 1 }), fat(100, { ts: 1 })], 0);
+
+    assert.deepStrictEqual(
+      buf
+        .take(0)
+        .flat()
+        .map((s) => s.ts),
+      [1, 1],
+    );
+    assert.strictEqual(buf.dropped, 2);
+  });
+
+  it("refuses a delta whose whole does not fit, rather than part of it", () => {
+    const buf = buffer({ maxBytes: 500 });
+    buf.add([fat(300), fat(300)], 0);
+
+    assert.strictEqual(buf.length, 0);
+    assert.strictEqual(buf.dropped, 2);
+    assert.strictEqual(buf.byteSize, 0);
+  });
+
+  it("requeues deltas whole", () => {
+    const buf = buffer({ batchSize: 2 });
+    buf.add(delta(1, 2), 0);
+    buf.add(delta(2, 2), 0);
+
+    buf.requeue(buf.take(0));
+
+    assert.deepStrictEqual(
+      buf.take(0).map((d) => d.map((s) => s.ts)),
+      [[1, 1]],
+    );
   });
 });

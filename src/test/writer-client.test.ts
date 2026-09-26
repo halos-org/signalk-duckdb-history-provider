@@ -99,10 +99,10 @@ describe("delivery", () => {
     client.start();
     await eventually(() => client!.stats.connected, "the handshake");
 
-    client.add(sample({ ts: 1 }));
-    client.add(sample({ ts: 2 }));
+    client.add([sample({ ts: 1 })]);
+    client.add([sample({ ts: 2 })]);
     assert.strictEqual(store.rowCount(), 0, "two of three is not a batch");
-    client.add(sample({ ts: 3 }));
+    client.add([sample({ ts: 3 })]);
 
     await eventually(() => store.rowCount() === 3, "the batch to land");
     // A second wait, because these two counters move on the acknowledgement
@@ -124,7 +124,7 @@ describe("delivery", () => {
     client.start();
     await eventually(() => client!.stats.connected, "the handshake");
 
-    client.add(sample());
+    client.add([sample()]);
     await eventually(() => store.rowCount() === 1, "the interval flush");
   });
 
@@ -140,7 +140,7 @@ describe("delivery", () => {
     client.start();
     await eventually(() => client!.stats.connected, "the handshake");
 
-    for (let i = 1; i <= 6; i++) client.add(sample({ ts: i }));
+    for (let i = 1; i <= 6; i++) client.add([sample({ ts: i })]);
     await eventually(() => store.rowCount() === 6, "all six samples");
     // Same round-trip gap as above: the counter is waited for, not read off
     // the row count.
@@ -164,7 +164,7 @@ describe("when the writer is not there", () => {
     });
     client.start();
 
-    for (let i = 1; i <= 4; i++) client.add(sample({ ts: i }));
+    for (let i = 1; i <= 4; i++) client.add([sample({ ts: i })]);
     assert.strictEqual(buffer.length, 4, "held, not sent and not dropped");
 
     await startServer();
@@ -263,7 +263,7 @@ describe("a batch that cannot be framed", () => {
     buffer.take = (now: number) => {
       if (handedOut) return realTake(now);
       handedOut = true;
-      return oversized;
+      return [oversized.slice(0, 2), oversized.slice(2)];
     };
 
     client = new WriterClient({
@@ -275,11 +275,15 @@ describe("a batch that cannot be framed", () => {
     });
     client.start();
     await eventually(() => client!.stats.connected, "the handshake");
-    client.add(sample());
+    client.add([sample()]);
 
     await eventually(() => unhealthy.length > 0, "an unhealthy report");
     assert.match(unhealthy[0], /could not be framed/);
-    assert.strictEqual(client.stats.dropped, 5, "the loss was not counted");
+    assert.strictEqual(
+      client.stats.dropped,
+      5,
+      "the loss was not counted in samples",
+    );
     assert.strictEqual(store.rowCount(), 0);
   });
 });
@@ -328,7 +332,7 @@ describe("a writer that stops answering", () => {
       });
       client.start();
       await eventually(() => client!.stats.connected, "the handshake");
-      client.add(sample());
+      client.add([sample()]);
 
       await eventually(
         () => unhealthy.some((m) => /has not acknowledged/.test(m)),
@@ -371,17 +375,17 @@ describe("recovery", () => {
     buffer.take = (now: number) => {
       if (handedOut) return realTake(now);
       handedOut = true;
-      return Array.from({ length: 5 }, (_, i) =>
+      return Array.from({ length: 5 }, (_, i) => [
         sample({ ts: i, kind: "string", value: "x".repeat(1024 * 1024) }),
-      );
+      ]);
     };
-    client.add(sample());
+    client.add([sample()]);
     await eventually(() => unhealthy.length > 0, "an unhealthy report");
     buffer.take = realTake;
 
     // The stability timer will not fire for another minute, so only an ack
     // can clear this.
-    client.add(sample({ ts: 2 }));
+    client.add([sample({ ts: 2 })]);
     await eventually(() => healthy > 0, "recovery on the next acknowledgement");
     // The count is not the claim here -- the sample buffered alongside the
     // stubbed batch rides along on the same flush. What matters is that an
@@ -402,7 +406,7 @@ describe("a batch on the wire when the connection ends", () => {
     const frontPath = join(dir, "run", "front.sock");
     proxy = await lossyProxy(frontPath, socketPath);
 
-    const buffer = newBuffer({ flushIntervalMs: 60_000, batchSize: 2 });
+    const buffer = newBuffer({ flushIntervalMs: 60_000, batchSize: 3 });
     client = new WriterClient({
       socketPath: frontPath,
       session: "s1",
@@ -412,9 +416,9 @@ describe("a batch on the wire when the connection ends", () => {
     client.start();
     await eventually(() => client!.stats.connected, "the handshake");
 
-    client.add(sample({ ts: 1 }));
-    client.add(sample({ ts: 2 }));
-    await eventually(() => store.rowCount() === 2, "the batch to be committed");
+    client.add([sample({ ts: 1 })]);
+    client.add([sample({ ts: 2, path: "a" }), sample({ ts: 2, path: "b" })]);
+    await eventually(() => store.rowCount() === 3, "the batch to be committed");
     await eventually(() => proxy!.swallowedAck, "the ack to be swallowed");
 
     // Reconnecting, the client learns the writer's last committed sequence
@@ -425,7 +429,8 @@ describe("a batch on the wire when the connection ends", () => {
       "the in-flight batch to be settled",
     );
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.strictEqual(store.rowCount(), 2, "the committed batch stayed once");
+    assert.strictEqual(store.rowCount(), 3, "the committed batch stayed once");
+    assert.strictEqual(client.stats.stored, 3, "stored counts samples");
   });
 
   it("is sent again when the writer never had it", async () => {
@@ -443,8 +448,8 @@ describe("a batch on the wire when the connection ends", () => {
     // Kill the server first, so the batch is written into a dead socket.
     await server!.close();
     server = null;
-    client.add(sample({ ts: 1 }));
-    client.add(sample({ ts: 2 }));
+    client.add([sample({ ts: 1 })]);
+    client.add([sample({ ts: 2 })]);
 
     await startServer();
     await eventually(() => store.rowCount() === 2, "the batch to be resent");
@@ -470,7 +475,7 @@ describe("a session of its own", () => {
     client.start();
     await eventually(() => client!.stats.connected, "the handshake");
 
-    client.add(sample({ ts: 1 }));
+    client.add([sample({ ts: 1 })]);
     await eventually(() => store.rowCount() === 2, "the new run's sample");
   });
 });
