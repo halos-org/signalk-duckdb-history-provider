@@ -73,19 +73,56 @@ const SQL_AGGREGATES: readonly string[] = [
   "mid",
 ];
 
+const POSITION_PATH = "navigation.position";
+
+const AGGREGATE_NAMES: readonly string[] = [
+  ...SQL_AGGREGATES,
+  "middle_index",
+  "sma",
+  "ema",
+];
+
+function selectsRecordedValue(aggregate: string): boolean {
+  return (
+    aggregate === "first" ||
+    aggregate === "last" ||
+    aggregate === "middle_index"
+  );
+}
+
+/**
+ * Whether a text, position or object column may be read with this aggregate.
+ *
+ * Text cannot be averaged; a position is a point, and a per-axis minimum or
+ * mean is a place the vessel never was; and a per-field average of an object
+ * has no general meaning, since nothing here says whether a field is an angle,
+ * a vector component or a coordinate. So all three take only the aggregates
+ * that pick a recorded value, and a raw read, which returns every value as
+ * recorded. Smoothing is refused either way.
+ */
+function appliesToValue(aggregate: string, bucketed: boolean): boolean {
+  if (aggregate === "sma" || aggregate === "ema") return false;
+  return !bucketed || selectsRecordedValue(aggregate);
+}
+
+function refusal(aggregate: string, kind: string, path: string): Error {
+  return new Error(
+    `Aggregate ${aggregate} does not apply to ${kind} path ${path}: ` +
+      `use first, last or middle_index`,
+  );
+}
+
 /**
  * An aggregate name as the query layer spells it.
  *
  * Resolved through a fixed set, never interpolated: an aggregate reaching the
  * statement as text would reach `read_parquet` and `COPY`, which on this
  * storage is local file read and write rather than a database's own tables.
- * An unknown name takes the same default the sibling provider takes.
+ * Names outside the set are refused before this is reached.
  */
 function toQueryAggregate(method: AggregateMethod): ValueAggregate {
   if (needsClientSideAggregation(method)) return "raw";
-  return SQL_AGGREGATES.includes(method)
-    ? (method as ValueAggregate)
-    : "average";
+  return method as ValueAggregate;
 }
 
 /**
@@ -166,26 +203,6 @@ function normalizeContext(context: string, selfContext: string): string {
     return "self";
   }
   return context;
-}
-
-/**
- * Whether an object path may be read with this aggregate.
- *
- * An aggregate on an object applies to the object as a whole, and a per-field
- * average has no general meaning — an angle, a vector component and a
- * coordinate average differently, and nothing here says which a field is. So
- * an object takes only the aggregates that select a recorded delta, and a
- * read without a resolution, which returns every delta as recorded.
- * Smoothing is refused either way: it would average across deltas too.
- */
-function appliesToObject(aggregate: string, bucketed: boolean): boolean {
-  if (aggregate === "sma" || aggregate === "ema") return false;
-  if (!bucketed) return true;
-  return (
-    aggregate === "first" ||
-    aggregate === "last" ||
-    aggregate === "middle_index"
-  );
 }
 
 /**
@@ -312,6 +329,22 @@ export function createHistoryV2(
     const resolution = query.resolution ?? 0;
     const bucketSeconds = resolution > 0 ? effectiveResolution(resolution) : 0;
 
+    for (const { aggregate, path } of query.pathSpecs) {
+      if (!AGGREGATE_NAMES.includes(aggregate)) {
+        throw new Error(
+          `Unknown aggregate ${aggregate}: use ` +
+            `${AGGREGATE_NAMES.slice(0, -1).join(", ")} or ` +
+            `${AGGREGATE_NAMES.at(-1)}`,
+        );
+      }
+      // Known from the path alone, so refused before anything is queried.
+      if (
+        path === POSITION_PATH &&
+        !appliesToValue(aggregate, bucketSeconds > 0)
+      ) {
+        throw refusal(aggregate, "position", path);
+      }
+    }
     guardBuckets(query.pathSpecs, resolution, bucketSeconds, toMs - fromMs);
 
     const requestedContext = query.context ?? "vessels.self";
@@ -397,27 +430,54 @@ export function createHistoryV2(
         .map(({ index }) => index),
     );
 
+    // Text rows are held apart until every row is in: a text row can share its
+    // timestamp with a number, and only a series apart keeps that number.
+    const withNumbers = new Set<number>();
+    const textRows = new Map<number, Map<number, unknown>>();
     for (const raw of answer.rows) {
       const row = toValueRow(raw);
+      if (row.num === null && row.str !== null) {
+        const text = textRows.get(row.spec) ?? new Map<number, unknown>();
+        textRows.set(row.spec, text);
+        text.set(row.bucket, decode(row));
+        continue;
+      }
       const series = bySpec.get(row.spec) ?? new Map<number, unknown>();
       bySpec.set(row.spec, series);
       series.set(row.bucket, decode(row));
-      if (row.num === null && row.str !== null) fromText.add(row.spec);
+      if (row.num !== null) withNumbers.add(row.spec);
       if (row.obj !== null) objects.add(row.spec);
-      if (!onGrid.has(row.spec)) continue;
-      if (row.bucket < firstBucket) firstBucket = row.bucket;
-      if (row.bucket > lastBucket) lastBucket = row.bucket;
     }
 
-    // After the query rather than before it: whether a path is an object is
-    // known only from its rows, and the request is one statement.
+    // A path with numbers in the range is numeric, and its text rows are
+    // dropped: the sibling provider reads the numeric table first and never
+    // looks at text once it has a number, and the two must answer alike.
+    for (const [index, text] of textRows) {
+      if (withNumbers.has(index)) continue;
+      fromText.add(index);
+      const series = bySpec.get(index) ?? new Map<number, unknown>();
+      bySpec.set(index, series);
+      for (const [stamp, value] of text) series.set(stamp, value);
+    }
+    for (const index of onGrid) {
+      for (const bucket of bySpec.get(index)?.keys() ?? []) {
+        if (bucket < firstBucket) firstBucket = bucket;
+        if (bucket > lastBucket) lastBucket = bucket;
+      }
+    }
+
+    // After the query rather than before it: whether a path is an object or
+    // text is known only from its rows, and the request is one statement.
     for (const index of objects) {
       const { aggregate, path } = pathSpecs[index];
-      if (!appliesToObject(aggregate, bucketSeconds > 0)) {
-        throw new Error(
-          `Aggregate ${aggregate} does not apply to object path ${path}: ` +
-            `use first, last or middle_index`,
-        );
+      if (!appliesToValue(aggregate, bucketSeconds > 0)) {
+        throw refusal(aggregate, "object", path);
+      }
+    }
+    for (const index of fromText) {
+      const { aggregate, path } = pathSpecs[index];
+      if (!appliesToValue(aggregate, bucketSeconds > 0)) {
+        throw refusal(aggregate, "text", path);
       }
     }
 
@@ -427,8 +487,9 @@ export function createHistoryV2(
       const series = bySpec.get(index);
       if (series === undefined) continue;
       const stamps = [...series.keys()].sort((a, b) => a - b);
-      if (objects.has(index)) {
-        // Only middle_index is left for an object: the middle delta, whole.
+      if (spec.aggregate === "middle_index") {
+        // The middle recorded value, whatever it is: a number, text, a
+        // position, or an object delta whole.
         const middle = stamps[Math.floor(stamps.length / 2)];
         bySpec.set(
           index,
@@ -442,26 +503,11 @@ export function createHistoryV2(
         const value = series.get(ts);
         return typeof value === "number" ? value : null;
       });
-      let computed: (number | null)[];
-      if (spec.aggregate === "sma") {
-        computed = computeSMA(numbers, smaWindow(spec.parameter?.[0]));
-      } else if (spec.aggregate === "ema") {
-        computed = computeEMA(numbers, emaAlpha(spec.parameter?.[0]));
-      } else {
-        const middle = Math.floor(numbers.length / 2);
-        computed = numbers.map((value, i) => (i === middle ? value : null));
-      }
+      const computed =
+        spec.aggregate === "sma"
+          ? computeSMA(numbers, smaWindow(spec.parameter?.[0]))
+          : computeEMA(numbers, emaAlpha(spec.parameter?.[0]));
       bySpec.set(index, new Map(stamps.map((ts, i) => [ts, computed[i]])));
-    }
-
-    // Report the reduction that ran. A downsampled text series always takes
-    // the value in force at the bucket's end, so leaving the caller's
-    // requested method in the response would label a series with an
-    // aggregation that never happened. Positions keep the requested name, as
-    // they do in the sibling provider, even though anything but `last` gets
-    // the first fix in the bucket.
-    if (bucketSeconds > 0) {
-      for (const index of fromText) values[index].method = "last";
     }
 
     // The timeline: every bucket between the first and the last that holds

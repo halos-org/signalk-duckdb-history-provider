@@ -149,7 +149,7 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
     ]);
   });
 
-  it("replays a downsampled boolean as a boolean, and says it took the last", async () => {
+  it("replays a downsampled boolean as a boolean under first and last", async () => {
     record(
       sample({
         ts: AUG_23 + 1000,
@@ -166,12 +166,19 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
     );
 
     const answer = await history.getValues(
-      ask({ pathSpecs: [spec("s.t")], resolution: 10 }),
+      ask({
+        pathSpecs: [spec("s.t", "first"), spec("s.t", "last")],
+        resolution: 10,
+      }),
     );
 
-    assert.deepEqual(answer.data, [[new Date(AUG_23).toISOString(), true]]);
-    // Averaging text never happened, so the response must not claim it did.
-    assert.deepEqual(answer.values, [{ path: "s.t", method: "last" }]);
+    assert.deepEqual(answer.data, [
+      [new Date(AUG_23).toISOString(), false, true],
+    ]);
+    assert.deepEqual(answer.values, [
+      { path: "s.t", method: "first" },
+      { path: "s.t", method: "last" },
+    ]);
   });
 
   it("returns a position that was recorded", async () => {
@@ -576,6 +583,221 @@ describe(
   },
 );
 
+describe(
+  "getValues with an aggregate a path cannot take",
+  { skip: NO_BUNDLED_EXTENSION },
+  () => {
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const refused = (kind: string, path: string, aggregate: string) =>
+      new RegExp(
+        `^Error: Aggregate ${aggregate} does not apply to ${kind} path ` +
+          `${path.replace(/\./g, "\\.")}: use first, last or middle_index$`,
+      );
+
+    function positions(): void {
+      record(
+        ...[60, 61, 62].map((latitude, i) =>
+          sample({
+            ts: AUG_23 + 1000 * (i + 1),
+            path: "navigation.position",
+            kind: "position",
+            value: { latitude, longitude: 24 },
+          }),
+        ),
+      );
+    }
+
+    function states(): void {
+      record(
+        ...["a", "b", "c"].map((value, i) =>
+          sample({
+            ts: AUG_23 + 1000 * (i + 1),
+            path: "s.t",
+            kind: "string",
+            value,
+          }),
+        ),
+      );
+    }
+
+    it("rejects an unknown aggregate name", async () => {
+      record(sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }));
+      await assert.rejects(
+        history.getValues(ask({ pathSpecs: [spec("a.b", "bogus")] })),
+        /^Error: Unknown aggregate bogus: use average, min, max, first, last, mid, middle_index, sma or ema$/,
+      );
+    });
+
+    it("rejects avg, which Skip and KIP send, as unknown", async () => {
+      record(sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }));
+      await assert.rejects(
+        history.getValues(
+          ask({ pathSpecs: [spec("a.b", "avg")], resolution: 10 }),
+        ),
+        /^Error: Unknown aggregate avg: /,
+      );
+    });
+
+    it("refuses a downsampled arithmetic aggregate on a position", async () => {
+      positions();
+      for (const aggregate of ["average", "min", "max", "mid"]) {
+        await assert.rejects(
+          history.getValues(
+            ask({
+              pathSpecs: [spec("navigation.position", aggregate)],
+              resolution: 10,
+            }),
+          ),
+          refused("position", "navigation.position", aggregate),
+        );
+      }
+    });
+
+    it("refuses smoothing a position or a text path without a resolution", async () => {
+      positions();
+      states();
+      for (const aggregate of ["sma", "ema"]) {
+        await assert.rejects(
+          history.getValues(
+            ask({ pathSpecs: [spec("navigation.position", aggregate)] }),
+          ),
+          refused("position", "navigation.position", aggregate),
+        );
+        await assert.rejects(
+          history.getValues(ask({ pathSpecs: [spec("s.t", aggregate)] })),
+          refused("text", "s.t", aggregate),
+        );
+      }
+    });
+
+    it("refuses a downsampled arithmetic aggregate on a text path", async () => {
+      states();
+      for (const aggregate of ["average", "min", "max", "mid"]) {
+        await assert.rejects(
+          history.getValues(
+            ask({ pathSpecs: [spec("s.t", aggregate)], resolution: 10 }),
+          ),
+          refused("text", "s.t", aggregate),
+        );
+      }
+    });
+
+    it("returns recorded values without a resolution, labelled as asked", async () => {
+      positions();
+      states();
+      const answer = await history.getValues(
+        ask({
+          pathSpecs: [spec("navigation.position", "average"), spec("s.t")],
+        }),
+      );
+      assert.deepEqual(answer.data, [
+        [iso(AUG_23 + 1000), { latitude: 60, longitude: 24 }, "a"],
+        [iso(AUG_23 + 2000), { latitude: 61, longitude: 24 }, "b"],
+        [iso(AUG_23 + 3000), { latitude: 62, longitude: 24 }, "c"],
+      ]);
+      assert.deepEqual(
+        answer.values.map((v) => v.method),
+        ["average", "average"],
+      );
+    });
+
+    it("keeps the middle position and text value for middle_index", async () => {
+      positions();
+      states();
+      const answer = await history.getValues(
+        ask({
+          pathSpecs: [
+            spec("navigation.position", "middle_index"),
+            spec("s.t", "middle_index"),
+          ],
+          resolution: 10,
+        }),
+      );
+      assert.deepEqual(answer.data, [
+        [iso(AUG_23 + 1000), null, null],
+        [iso(AUG_23 + 2000), { latitude: 61, longitude: 24 }, "b"],
+        [iso(AUG_23 + 3000), null, null],
+      ]);
+    });
+
+    it("serves a mixed path's numbers and ignores its text, as QuestDB does", async () => {
+      record(
+        sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }),
+        sample({ ts: AUG_23 + 3000, path: "a.b", value: 2 }),
+        sample({
+          ts: AUG_23 + 25_000,
+          path: "a.b",
+          kind: "string",
+          value: "x",
+        }),
+      );
+
+      const averaged = await history.getValues(
+        ask({ pathSpecs: [spec("a.b")], resolution: 10 }),
+      );
+      assert.deepEqual(averaged.data, [[iso(AUG_23), 1.5]]);
+
+      const smoothed = await history.getValues(
+        ask({ pathSpecs: [spec("a.b", "sma", { parameter: ["2"] })] }),
+      );
+      assert.deepEqual(smoothed.data, [
+        [iso(AUG_23 + 1000), 1],
+        [iso(AUG_23 + 3000), 1.5],
+      ]);
+    });
+
+    it("keeps a mixed path's number when its text shares the timestamp", async () => {
+      record(
+        sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }),
+        sample({ ts: AUG_23 + 1000, path: "a.b", kind: "string", value: "x" }),
+        sample({ ts: AUG_23 + 3000, path: "a.b", value: 2 }),
+      );
+
+      const averaged = await history.getValues(
+        ask({ pathSpecs: [spec("a.b")], resolution: 10 }),
+      );
+      assert.deepEqual(averaged.data, [[iso(AUG_23), 1.5]]);
+
+      const smoothed = await history.getValues(
+        ask({ pathSpecs: [spec("a.b", "sma", { parameter: ["2"] })] }),
+      );
+      assert.deepEqual(smoothed.data, [
+        [iso(AUG_23 + 1000), 1],
+        [iso(AUG_23 + 3000), 1.5],
+      ]);
+    });
+
+    it("keeps the middle numeric value for middle_index", async () => {
+      record(
+        ...[10, 20, 30].map((value, i) =>
+          sample({ ts: AUG_23 + 1000 * (i + 1), path: "a.b", value }),
+        ),
+      );
+      for (const resolution of [undefined, 10]) {
+        const answer = await history.getValues(
+          ask({
+            pathSpecs: [spec("a.b", "middle_index")],
+            ...(resolution === undefined ? {} : { resolution }),
+          }),
+        );
+        assert.deepEqual(answer.data, [
+          [iso(AUG_23 + 1000), null],
+          [iso(AUG_23 + 2000), 20],
+          [iso(AUG_23 + 3000), null],
+        ]);
+      }
+    });
+
+    it("answers an empty column for a downsampled average with no rows", async () => {
+      const answer = await history.getValues(
+        ask({ pathSpecs: [spec("s.t")], resolution: 10 }),
+      );
+      assert.deepEqual(answer.data, []);
+      assert.deepEqual(answer.values, [{ path: "s.t", method: "average" }]);
+    });
+  },
+);
+
 describe("getValues on an object path", { skip: NO_BUNDLED_EXTENSION }, () => {
   const iso = (ms: number) => new Date(ms).toISOString();
 
@@ -715,7 +937,7 @@ describe("getValues on an object path", { skip: NO_BUNDLED_EXTENSION }, () => {
   it("refuses a downsampled arithmetic aggregate", async () => {
     attitude(AUG_23 + 1000, { roll: 1 });
 
-    for (const aggregate of ["average", "min", "max", "mid", "bogus"]) {
+    for (const aggregate of ["average", "min", "max", "mid"]) {
       await assert.rejects(
         history.getValues(
           ask({

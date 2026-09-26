@@ -561,11 +561,11 @@ describe("a values query", { skip: NO_BUNDLED_EXTENSION }, () => {
     );
 
     const result = await runner.run(
-      values({ specs: [{ path: "s.t", aggregate: "average" }] }),
+      values({ specs: [{ path: "s.t", aggregate: "last" }] }),
     );
 
     // The numeric reduction has nothing to work with; the text one takes the
-    // value in force at the end of the bucket.
+    // latest value in the bucket.
     assert.equal(result.rows[0][2], null);
     assert.equal(result.rows[0][3], "true");
     assert.equal(result.rows[0][4], "boolean");
