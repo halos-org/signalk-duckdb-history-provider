@@ -6,17 +6,22 @@
  * **behaviour is deliberately identical**, because Unit 4c has to reproduce
  * that provider's history contract; only the comments are retargeted from its
  * three QuestDB tables to this store's `value_kind` column. Fix bugs in both.
+ * The sibling has since folded its copy into `src/ingestion/recorder.ts`, with
+ * the pointer name in `src/storage/pointer.ts`; the rules are the same.
  *
  * The kinds are `number`, `string`, `boolean`, `position` and `identity`.
  * `flatten` is not a kind — it means the value is an object whose scalar
- * leaves are recorded as ordinary paths of their own.
+ * leaves are recorded one row each, under pointer names: the object's path,
+ * `#`, and an RFC 6901 JSON pointer to the field (`navigation.attitude#/roll`).
+ * `#` never occurs in a Signal K path, so a leaf cannot be mistaken for a real
+ * scalar path, and the object can be put back together when it is read.
  */
 export type DeltaRoute =
   "number" | "string" | "boolean" | "position" | "flatten" | null;
 
 /** One scalar leaf pulled out of an object value, ready to record. */
 export interface FlattenedLeaf {
-  /** Parent path plus the key, e.g. `navigation.attitude.roll`. */
+  /** Parent path, `#`, and a pointer to the key, e.g. `navigation.attitude#/roll`. */
   path: string;
   value: number | string | boolean;
 }
@@ -59,7 +64,7 @@ export function routeDeltaValue(path: string, value: unknown): DeltaRoute {
   if (typeof value === "boolean") return "boolean";
   // Only `navigation.position` is a position. Other lat/lon-object paths —
   // navigation.anchor.position, which anchor plugins re-emit on every fix
-  // while watching — record their latitude and longitude as ordinary scalar
+  // while watching — record their latitude and longitude as pointer-named
   // leaves instead.
   //
   // In the sibling the reason is structural: its position table has no path
@@ -67,40 +72,49 @@ export function routeDeltaValue(path: string, value: unknown): DeltaRoute {
   // Here rows carry their path and that cannot happen. The rule is kept
   // anyway, because it decides what the history surfaces return for a
   // position query, and Unit 4c reproduces that contract.
-  if (
-    path === "navigation.position" &&
-    value !== null &&
-    typeof value === "object" &&
-    "latitude" in value &&
-    "longitude" in value &&
-    Number.isFinite((value as { latitude: unknown }).latitude) &&
-    Number.isFinite((value as { longitude: unknown }).longitude)
-  )
-    return "position";
+  //
+  // A `navigation.position` that is not a usable position is dropped rather
+  // than flattened. Half a coordinate is not a track point, and its leaves
+  // stored as `navigation.position#/latitude` would be a second, partial
+  // representation of the one path the position kind owns.
+  if (path === "navigation.position") {
+    return value !== null &&
+      typeof value === "object" &&
+      Number.isFinite((value as { latitude?: unknown }).latitude) &&
+      Number.isFinite((value as { longitude?: unknown }).longitude)
+      ? "position"
+      : null;
+  }
   // Any other non-null, non-array object: record its scalar leaves
-  // individually. Arrays are excluded deliberately — their indices are not
-  // stable identities, so `foo.0` would silently mean a different thing from
-  // one delta to the next.
+  // individually, under pointer names. Arrays are excluded deliberately —
+  // their indices are not stable identities, so `foo#/0` would silently mean
+  // a different thing from one delta to the next.
   if (value !== null && typeof value === "object" && !Array.isArray(value))
     return "flatten";
   return null;
 }
 
 /**
- * Scalar leaves of an object value, as dotted paths.
+ * Scalar leaves of an object value, under pointer names.
  *
  *   navigation.attitude {roll: 0.02, yaw: 1.57}
- *     -> navigation.attitude.roll  0.02
- *     -> navigation.attitude.yaw   1.57
+ *     -> navigation.attitude#/roll  0.02
+ *     -> navigation.attitude#/yaw   1.57
+ *
+ * The part after `#` is an RFC 6901 JSON pointer, so a key holding `~` or `/`
+ * is escaped (`~0`, `~1`) and the name still splits back into path and key
+ * unambiguously. An empty key is skipped: its pointer `#/` would read as the
+ * object itself.
  *
  * **One level deep, deliberately.** That covers attitude and effectively every
  * real Signal K object, while a recursive walk would happily write out whole
  * nested payloads (notifications, resource documents) that nobody asked to
  * record. A nested object is therefore skipped, not descended into.
  *
- * The leaves are ordinary scalar paths, which is what makes this cheap: no
- * schema change, and sampling, path filtering, the cardinality cap, retention
- * and both history surfaces apply to them unchanged.
+ * The leaves are ordinary rows, which is what makes this cheap: no schema
+ * change, and retention and the roll treat them like any other. The gates —
+ * path filter, sampling rate and cardinality cap — are the caller's, and apply
+ * to the object's own path rather than to each leaf.
  */
 export function flattenObjectValue(
   path: string,
@@ -110,14 +124,15 @@ export function flattenObjectValue(
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return leaves;
   }
-  // An empty parent would build ".name" — a leading-dot path that matches no
-  // Signal K path and no filter pattern. The recorder already returns before
+  // An empty parent would build "#/name" — a leaf with no path in front of
+  // it. The recorder already returns before
   // reaching here for path "" (that shape is the vessel identity report,
   // handled by extractVesselName), so this is belt-and-braces: the function
   // must not depend on a caller's guard to avoid emitting a malformed path.
   if (path === "") return leaves;
   for (const [key, leaf] of Object.entries(value as Record<string, unknown>)) {
-    const leafPath = `${path}.${key}`;
+    if (key === "") continue;
+    const leafPath = pointerPath(path, key);
     if (typeof leaf === "number") {
       // A non-finite leaf is "no reading", same rule as the top-level path.
       if (Number.isFinite(leaf)) leaves.push({ path: leafPath, value: leaf });
@@ -127,4 +142,10 @@ export function flattenObjectValue(
     // Anything else — nested object, array, null, undefined — has no column.
   }
   return leaves;
+}
+
+/** The stored name of field `key` of the object at `path`. */
+export function pointerPath(path: string, key: string): string {
+  // `~` before `/`, or the `~` that `/` becomes would be escaped again.
+  return `${path}#/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`;
 }

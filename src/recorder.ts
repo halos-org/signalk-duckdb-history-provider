@@ -22,6 +22,8 @@ export interface BusValue {
   value: unknown;
   context: string;
   $source?: unknown;
+  /** Set by the server on metadata (`NormalizedMetaDelta`), which is not history. */
+  isMeta?: boolean;
 }
 
 export interface RecorderOptions {
@@ -99,6 +101,8 @@ export class Recorder {
   }
 
   handle(item: BusValue): void {
+    if (item.isMeta === true) return;
+
     // The delta's sourceRef, kept so interleaved multi-source streams (two GPS
     // receivers) can be told apart afterwards and filtered through the history
     // API's `path|sourceRef` syntax.
@@ -142,18 +146,19 @@ export class Recorder {
     if (isSelf && !this.config.recordSelf) return;
     if (!isSelf && !this.config.recordOthers) return;
 
-    // Routed once, before the gates, because an object value is gated on its
-    // leaf paths instead. Applying the parent's gates to those would be wrong
-    // twice over: an include-filter naming only `navigation.attitude.roll`
-    // would drop the parent before any leaf was seen, and the parent would
-    // consume a throttle slot the leaves then wait out again, halving the
-    // effective sampling rate.
     const route = routeDeltaValue(item.path, item.value);
     if (route === null) return;
 
     const ts = this.now();
     if (route === "flatten") {
-      for (const leaf of flattenObjectValue(item.path, item.value)) {
+      // An object is one Signal K path, so it is gated once, on that path: the
+      // filter, the sampling rate and the path cap all see
+      // `navigation.attitude`, never a field of it. Gating each field instead
+      // would let a filter or a throttle keep half of an object.
+      const leaves = flattenObjectValue(item.path, item.value);
+      if (leaves.length === 0) return;
+      if (!this.admit(item.path, context)) return;
+      for (const leaf of leaves) {
         this.recordScalar(ts, context, leaf.path, source, leaf.value);
       }
       return;
@@ -170,6 +175,7 @@ export class Recorder {
       });
       return;
     }
+    if (!this.admit(item.path, context)) return;
     this.recordScalar(
       ts,
       context,
@@ -186,7 +192,6 @@ export class Recorder {
     source: string | null,
     value: number | string | boolean,
   ): void {
-    if (!this.admit(path, context)) return;
     if (typeof value === "number") {
       this.record({ ts, context, path, source, kind: "number", value });
     } else if (typeof value === "boolean") {

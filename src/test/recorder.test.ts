@@ -90,20 +90,45 @@ describe("what reaches the writer", () => {
     assert.strictEqual(t.samples[0].kind, "position");
   });
 
-  it("records an object's scalar leaves under their own paths", () => {
-    const t = build({ defaultSamplingRate: 0 });
+  it("records an object's scalar leaves under pointer names, one ts", () => {
+    const t = build({ defaultSamplingRate: 0 }, 1_000);
     t.feed({
       path: "navigation.attitude",
-      value: { roll: 0.02, yaw: 1.57, nested: { no: 1 } },
+      value: { roll: 0.02, pitch: -0.01, yaw: 1.57, nested: { no: 1 } },
     });
 
     assert.deepStrictEqual(
-      t.samples.map((s) => [s.path, s.value]),
+      t.samples.map((s) => [s.ts, s.path, s.value]),
       [
-        ["navigation.attitude.roll", 0.02],
-        ["navigation.attitude.yaw", 1.57],
+        [1_000, "navigation.attitude#/roll", 0.02],
+        [1_000, "navigation.attitude#/pitch", -0.01],
+        [1_000, "navigation.attitude#/yaw", 1.57],
       ],
     );
+  });
+
+  it("records nothing for a navigation.position missing a coordinate", () => {
+    const t = build({ defaultSamplingRate: 0 });
+    t.feed({ path: "navigation.position", value: { latitude: 60.16 } });
+    t.feed({
+      path: "navigation.position",
+      value: { latitude: 60.16, longitude: NaN },
+    });
+
+    assert.deepStrictEqual(t.samples, []);
+  });
+
+  it("records nothing for a meta delta", () => {
+    // Units and display names are not history.
+    const t = build({ defaultSamplingRate: 0 });
+    t.feed({
+      path: "navigation.attitude",
+      value: { units: "rad", description: "Vessel attitude" },
+      isMeta: true,
+    });
+    t.feed({ path: "environment.depth.belowKeel", value: 4.2, isMeta: true });
+
+    assert.deepStrictEqual(t.samples, []);
   });
 
   it("keeps a missing source null rather than inventing one", () => {
@@ -272,19 +297,28 @@ describe("the path filter", () => {
     );
   });
 
-  it("gates an object's leaves, not the object's own path", () => {
-    // An include filter naming only a leaf would otherwise drop the parent
-    // before any leaf was seen.
+  it("gates an object on its own path", () => {
     const t = build({
       defaultSamplingRate: 0,
-      pathFilter: { mode: "include", paths: ["navigation.attitude.roll"] },
+      pathFilter: { mode: "exclude", paths: ["navigation.attitude"] },
     });
     t.feed({ path: "navigation.attitude", value: { roll: 0.02, yaw: 1.57 } });
 
-    assert.deepStrictEqual(
-      t.samples.map((s) => s.path),
-      ["navigation.attitude.roll"],
-    );
+    assert.deepStrictEqual(t.samples, []);
+  });
+
+  it("no longer matches an object by an entry naming one of its fields", () => {
+    // The object is stored whole or not at all, so an entry naming a field
+    // keeps none of it.
+    for (const entry of ["navigation.attitude.roll", "navigation.attitude.*"]) {
+      const t = build({
+        defaultSamplingRate: 0,
+        pathFilter: { mode: "include", paths: [entry] },
+      });
+      t.feed({ path: "navigation.attitude", value: { roll: 0.02, yaw: 1.57 } });
+
+      assert.deepStrictEqual(t.samples, [], entry);
+    }
   });
 });
 
@@ -313,6 +347,27 @@ describe("the rate cap", () => {
     assert.deepStrictEqual(
       t.samples.map((s) => s.context),
       [SELF_CONTEXT, OTHER],
+    );
+  });
+
+  it("throttles an object's fields together, on the object's path", () => {
+    const t = build(
+      {
+        defaultSamplingRate: 0,
+        samplingRates: { "navigation.attitude": 1000 },
+      },
+      1_000_000,
+    );
+    const attitude = { roll: 0.02, pitch: -0.01, yaw: 1.57 };
+    t.feed({ path: "navigation.attitude", value: attitude });
+    t.at(1_000_500);
+    t.feed({ path: "navigation.attitude", value: attitude });
+    t.at(1_001_000);
+    t.feed({ path: "navigation.attitude", value: attitude });
+
+    assert.deepStrictEqual(
+      t.samples.map((s) => s.ts),
+      [1_000_000, 1_000_000, 1_000_000, 1_001_000, 1_001_000, 1_001_000],
     );
   });
 
@@ -348,6 +403,30 @@ describe("the cardinality cap", () => {
     );
     assert.strictEqual(t.recorder.stats.pathsOverCap, 1);
     assert.strictEqual(t.recorder.stats.paths, 2);
+  });
+
+  it("counts an object's path once, whatever its fields", () => {
+    const t = build({ defaultSamplingRate: 0, maxRecordedPaths: 1 });
+    t.feed({
+      path: "navigation.attitude",
+      value: { roll: 0.02, pitch: -0.01, yaw: 1.57 },
+    });
+    t.feed({ path: "a.one", value: 1 });
+
+    assert.strictEqual(t.samples.length, 3);
+    assert.strictEqual(t.recorder.stats.paths, 1);
+    assert.strictEqual(t.recorder.stats.pathsOverCap, 1);
+  });
+
+  it("spends no path slot on an object with no field to record", () => {
+    const t = build({ defaultSamplingRate: 0, maxRecordedPaths: 1 });
+    t.feed({ path: "a.object", value: { nested: { deep: 1 }, empty: null } });
+    t.feed({ path: "a.one", value: 1 });
+
+    assert.deepStrictEqual(
+      t.samples.map((s) => s.path),
+      ["a.one"],
+    );
   });
 
   it("does not spend a context slot on a vessel whose paths are all filtered", () => {

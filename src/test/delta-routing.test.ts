@@ -49,7 +49,7 @@ describe("routeDeltaValue", () => {
     // navigation.anchor.position is re-emitted on every fix by anchor plugins
     // while watching; letting it into the path-less signalk_position table
     // interleaves it with the real vessel track. They flatten instead, so the
-    // anchor's coordinates are still recorded — as their own dotted paths,
+    // anchor's coordinates are still recorded — under pointer names,
     // where they cannot be confused with the vessel track
     // (dirkwa/signalk-questdb#128).
     for (const path of [
@@ -65,14 +65,7 @@ describe("routeDeltaValue", () => {
     }
   });
 
-  it("flattens objects that are not a usable position", () => {
-    // A boolean is a recordable value, not an absence.
-    // A half-position is not a track point, but its scalar leaves are still
-    // real readings, so they are recorded as dotted paths like anything else.
-    assert.strictEqual(
-      routeDeltaValue("navigation.position", { latitude: 1 }),
-      "flatten",
-    );
+  it("flattens objects other than navigation.position", () => {
     assert.strictEqual(
       routeDeltaValue("navigation.attitude", { roll: 0.1, pitch: 0 }),
       "flatten",
@@ -80,21 +73,20 @@ describe("routeDeltaValue", () => {
     assert.strictEqual(routeDeltaValue("navigation.position", null), null);
   });
 
-  it("keeps non-finite or non-numeric coordinates out of the position kind", () => {
-    // A NaN latitude is not a track point. The object still flattens, so the
-    // usable leaf beside it survives — and flattenObjectValue drops the
-    // non-finite one, so no coordinate that means nothing gets stored.
+  it("drops a navigation.position without a finite latitude and longitude", () => {
+    // Half a coordinate is not a track point, and its leaves stored under
+    // navigation.position#/latitude would be a second, partial form of the one
+    // path the position kind owns.
     for (const value of [
+      { latitude: 1 },
+      { longitude: 1 },
       { latitude: NaN, longitude: 13.4 },
       { latitude: "52.5", longitude: 13.4 },
       { latitude: 52.5, longitude: Infinity },
     ]) {
-      // Asserts "flatten", not merely "not position": the weaker form would
-      // also pass if these were dropped entirely, which is the outcome that
-      // matters.
       assert.strictEqual(
         routeDeltaValue("navigation.position", value),
-        "flatten",
+        null,
         JSON.stringify(value),
       );
     }
@@ -128,7 +120,7 @@ describe("routeDeltaValue", () => {
 });
 
 describe("flattenObjectValue (dirkwa/signalk-questdb#128)", () => {
-  it("pulls each scalar leaf out as its own dotted path", () => {
+  it("names each scalar leaf by the object path and a JSON pointer", () => {
     const leaves = flattenObjectValue("navigation.attitude", {
       roll: 0.02,
       pitch: -0.01,
@@ -136,9 +128,9 @@ describe("flattenObjectValue (dirkwa/signalk-questdb#128)", () => {
     });
 
     assert.deepStrictEqual(leaves, [
-      { path: "navigation.attitude.roll", value: 0.02 },
-      { path: "navigation.attitude.pitch", value: -0.01 },
-      { path: "navigation.attitude.yaw", value: 1.57 },
+      { path: "navigation.attitude#/roll", value: 0.02 },
+      { path: "navigation.attitude#/pitch", value: -0.01 },
+      { path: "navigation.attitude#/yaw", value: 1.57 },
     ]);
   });
 
@@ -150,9 +142,9 @@ describe("flattenObjectValue (dirkwa/signalk-questdb#128)", () => {
     });
 
     assert.deepStrictEqual(leaves, [
-      { path: "some.thing.count", value: 3 },
-      { path: "some.thing.label", value: "port" },
-      { path: "some.thing.active", value: true },
+      { path: "some.thing#/count", value: 3 },
+      { path: "some.thing#/label", value: "port" },
+      { path: "some.thing#/active", value: true },
     ]);
   });
 
@@ -164,7 +156,7 @@ describe("flattenObjectValue (dirkwa/signalk-questdb#128)", () => {
       worse: Infinity,
     });
 
-    assert.deepStrictEqual(leaves, [{ path: "sensor.x.good", value: 1.5 }]);
+    assert.deepStrictEqual(leaves, [{ path: "sensor.x#/good", value: 1.5 }]);
   });
 
   it("does not descend into nested objects", () => {
@@ -176,7 +168,7 @@ describe("flattenObjectValue (dirkwa/signalk-questdb#128)", () => {
       list: [1, 2],
     });
 
-    assert.deepStrictEqual(leaves, [{ path: "a.b.flat", value: 1 }]);
+    assert.deepStrictEqual(leaves, [{ path: "a.b#/flat", value: 1 }]);
   });
 
   it("drops null and undefined leaves", () => {
@@ -186,7 +178,7 @@ describe("flattenObjectValue (dirkwa/signalk-questdb#128)", () => {
       missing: undefined,
     });
 
-    assert.deepStrictEqual(leaves, [{ path: "a.b.present", value: 1 }]);
+    assert.deepStrictEqual(leaves, [{ path: "a.b#/present", value: 1 }]);
   });
 
   it("yields nothing for a non-object, an array or an empty object", () => {
@@ -197,8 +189,7 @@ describe("flattenObjectValue (dirkwa/signalk-questdb#128)", () => {
   });
 
   it("yields nothing for an empty parent path", () => {
-    // Would otherwise build ".name" — a leading-dot path matching no Signal K
-    // path and no filter pattern. Empty-path deltas are identity reports,
+    // Would otherwise build "#/name" — a leaf with no path in front of it. Empty-path deltas are identity reports,
     // handled by extractVesselName; this function must not depend on the
     // caller guarding that.
     const leaves = flattenObjectValue("", {
@@ -207,6 +198,24 @@ describe("flattenObjectValue (dirkwa/signalk-questdb#128)", () => {
     });
 
     assert.deepStrictEqual(leaves, []);
+  });
+
+  it("escapes ~ and / in a key per RFC 6901", () => {
+    // ~ first: escaping / first would turn its ~1 into ~01.
+    const leaves = flattenObjectValue("a.b", { "x/y": 1, "m~n": 2, "~/": 3 });
+
+    assert.deepStrictEqual(leaves, [
+      { path: "a.b#/x~1y", value: 1 },
+      { path: "a.b#/m~0n", value: 2 },
+      { path: "a.b#/~0~1", value: 3 },
+    ]);
+  });
+
+  it("skips an empty key", () => {
+    // Its pointer "#/" would read as the object itself.
+    const leaves = flattenObjectValue("a.b", { "": 1, kept: 2 });
+
+    assert.deepStrictEqual(leaves, [{ path: "a.b#/kept", value: 2 }]);
   });
 
   it("records the anchor position's coordinates under its own path", () => {
@@ -218,8 +227,8 @@ describe("flattenObjectValue (dirkwa/signalk-questdb#128)", () => {
     });
 
     assert.deepStrictEqual(leaves, [
-      { path: "navigation.anchor.position.latitude", value: 12.05 },
-      { path: "navigation.anchor.position.longitude", value: -61.75 },
+      { path: "navigation.anchor.position#/latitude", value: 12.05 },
+      { path: "navigation.anchor.position#/longitude", value: -61.75 },
     ]);
   });
 });
