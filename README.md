@@ -199,6 +199,19 @@ a dotted field gets no data recorded since the upgrade: new data is only
 reachable through the object path. A rename of the old rows, if wanted, is
 [signalk-duckdb-history-provider#41](https://github.com/halos-org/signalk-duckdb-history-provider/issues/41).
 
+## Reading one source
+
+Every row keeps the source that recorded it. Append `|<sourceRef>` to a path in
+a v2 request to read that source's rows only; the column is labelled with the
+source as `$source` in `values`. Without one, a path returns every source's rows
+together.
+
+`sourcePolicy=all` (server 2.32+) splits every path without a sourceRef into one
+column per source that has rows of it in the range, ordered by source and
+labelled with `$source`. Rows recorded without a source get their own column,
+last, with no `$source`. A path with no rows in the range gets no column. Such a
+request runs two statements rather than one: the first finds the sources.
+
 ## The bundled DuckDB extension
 
 DuckDB links `parquet` and `json` in statically but not `sqlite_scanner`, and

@@ -326,6 +326,9 @@ add a second concurrent engine without reading that issue.
 
 **One request compiles to one statement.** The sibling provider issues a query
 per pathSpec, which is free against a running server and is not free here.
+The one exception is `sourcePolicy: all`, which first runs a `sources` query:
+which columns the answer has depends on which sources hold rows, so it cannot
+be one statement.
 
 The service answers one request at a time; eight may queue and the rest are
 refused. A query that fails costs the request — the engine is worth more than

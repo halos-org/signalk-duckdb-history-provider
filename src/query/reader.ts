@@ -705,7 +705,9 @@ function compile(request: WindowedRequest, plan: Plan): Compiled | null {
   filters.push(...pathFilter(paths, params));
   const where = filters.join(" AND ");
   // A values request also reads the fields of any path that is an object.
-  const withFields = request.kind === "values" && paths.length > 0;
+  const withFields =
+    (request.kind === "values" || request.kind === "sources") &&
+    paths.length > 0;
 
   const branches: string[] = [];
   if (plan.files.length > 0) {
@@ -746,6 +748,14 @@ function compile(request: WindowedRequest, plan: Plan): Compiled | null {
   if (request.kind === "values") {
     return compileValues(request, union, params);
   }
+  if (request.kind === "sources") {
+    return {
+      text:
+        `SELECT DISTINCT split_part(path, '${POINTER}', 1) AS name, source ` +
+        `FROM (${union}) ORDER BY name, source`,
+      params,
+    };
+  }
   if (request.kind === "exists") {
     // Deliberately unordered, and the `LIMIT 1` is the whole point: the caller
     // asks this for a range that may be the entire tree, and the engine stops
@@ -775,6 +785,7 @@ function requestedContext(request: WindowedRequest): string | undefined {
 /** Every path a request needs, so the scan is pruned to those and no more. */
 function requestedPaths(request: WindowedRequest): string[] {
   if (request.kind === "range") return request.paths ?? [];
+  if (request.kind === "sources") return request.paths;
   if (request.kind === "values") {
     return [...new Set(request.specs.map((spec) => spec.path))];
   }
@@ -812,7 +823,9 @@ function compileValues(
   const branches = request.specs.map((spec, index) => {
     params[`p${index}`] = spec.path;
     let bySource = "";
-    if (spec.sourceRef !== undefined) {
+    if (spec.sourceRef === null) {
+      bySource = " AND source IS NULL";
+    } else if (spec.sourceRef !== undefined) {
       params[`s${index}`] = spec.sourceRef;
       bySource = ` AND source = $s${index}`;
     }
@@ -1011,6 +1024,7 @@ const KINDS = [
   "range",
   "values",
   "paths",
+  "sources",
   "contexts",
   "exists",
   "snapshot",
@@ -1055,7 +1069,7 @@ function validate(request: QueryRequest): void {
   }
   time("from", request.from);
   time("to", request.to);
-  if (request.kind === "values") {
+  if (request.kind === "values" || request.kind === "sources") {
     if (typeof request.context !== "string") {
       throw new Error("context must be a string");
     }
@@ -1092,8 +1106,12 @@ function validate(request: QueryRequest): void {
           `${JSON.stringify(spec.aggregate)} is not an aggregate; expected one of ${AGGREGATES.join(", ")}`,
         );
       }
-      if (spec.sourceRef !== undefined && typeof spec.sourceRef !== "string") {
-        throw new Error("sourceRef must be a string");
+      if (
+        spec.sourceRef !== undefined &&
+        spec.sourceRef !== null &&
+        typeof spec.sourceRef !== "string"
+      ) {
+        throw new Error("sourceRef must be a string or null");
       }
     }
     if (
@@ -1103,6 +1121,11 @@ function validate(request: QueryRequest): void {
     ) {
       throw new Error("bucketMs must be a number of milliseconds");
     }
+    return;
+  }
+  if (request.kind === "sources") {
+    if (request.paths === undefined) throw new Error("paths is required");
+    validatePaths(request.paths);
     return;
   }
   if (request.kind !== "range") return;
