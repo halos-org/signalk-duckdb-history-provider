@@ -366,6 +366,194 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
   });
 });
 
+describe("getValues on an object path", { skip: NO_BUNDLED_EXTENSION }, () => {
+  const iso = (ms: number) => new Date(ms).toISOString();
+
+  /** One attitude delta: every field shares its ts. */
+  function attitude(ts: number, fields: Record<string, number>): void {
+    record(
+      ...Object.entries(fields).map(([key, value]) =>
+        sample({ ts, path: `navigation.attitude#/${key}`, value }),
+      ),
+    );
+  }
+
+  const refusal = (aggregate: string) =>
+    new RegExp(
+      `^Error: Aggregate ${aggregate} does not apply to object path ` +
+        `navigation\\.attitude: use first, last or middle_index$`,
+    );
+
+  it("returns the latest delta of each bucket whole, with gaps null", async () => {
+    attitude(AUG_23 + 1000, { roll: 1, pitch: 1, yaw: 1 });
+    attitude(AUG_23 + 5000, { roll: 2, pitch: 2 });
+    attitude(AUG_23 + 25_000, { roll: 3, pitch: 3, yaw: 3 });
+
+    const answer = await history.getValues(
+      ask({
+        pathSpecs: [spec("navigation.attitude", "last")],
+        resolution: 10,
+      }),
+    );
+
+    assert.deepEqual(answer.data, [
+      [iso(AUG_23), { roll: 2, pitch: 2 }],
+      [iso(AUG_23 + 10_000), null],
+      [iso(AUG_23 + 20_000), { roll: 3, pitch: 3, yaw: 3 }],
+    ]);
+    assert.deepEqual(answer.values, [
+      { path: "navigation.attitude", method: "last" },
+    ]);
+  });
+
+  it("returns the earliest delta of each bucket for first", async () => {
+    attitude(AUG_23 + 1000, { roll: 1 });
+    attitude(AUG_23 + 5000, { roll: 2, pitch: 2 });
+
+    const answer = await history.getValues(
+      ask({
+        pathSpecs: [spec("navigation.attitude", "first")],
+        resolution: 10,
+      }),
+    );
+
+    assert.deepEqual(answer.data, [[iso(AUG_23), { roll: 1 }]]);
+  });
+
+  it("unescapes field names and replays text fields as recorded", async () => {
+    record(
+      sample({
+        ts: AUG_23 + 1000,
+        path: "notifications.mob#/state",
+        kind: "string",
+        value: "emergency",
+      }),
+      sample({
+        ts: AUG_23 + 1000,
+        path: "notifications.mob#/silenced",
+        kind: "boolean",
+        value: "false",
+      }),
+      sample({ ts: AUG_23 + 1000, path: "notifications.mob#/a~1b~0c" }),
+      sample({ ts: AUG_23 + 1000, path: "notifications.mob#/__proto__" }),
+    );
+
+    const answer = await history.getValues(
+      ask({
+        pathSpecs: [spec("notifications.mob", "last")],
+        resolution: 10,
+      }),
+    );
+
+    const value = answer.data[0][1] as Record<string, unknown>;
+    assert.deepEqual(Object.keys(value).sort(), [
+      "__proto__",
+      "a/b~c",
+      "silenced",
+      "state",
+    ]);
+    assert.equal(value.state, "emergency");
+    assert.equal(value.silenced, false);
+    assert.equal(Object.getPrototypeOf(value), Object.prototype);
+    assert.deepEqual(answer.values, [
+      { path: "notifications.mob", method: "last" },
+    ]);
+  });
+
+  it("returns one object per delta without a resolution, labelled as asked", async () => {
+    attitude(AUG_23 + 1000, { roll: 1, pitch: 1 });
+    attitude(AUG_23 + 2000, { roll: 2 });
+
+    for (const aggregate of ["average", "min", "last"]) {
+      const answer = await history.getValues(
+        ask({ pathSpecs: [spec("navigation.attitude", aggregate)] }),
+      );
+
+      assert.deepEqual(
+        answer.data,
+        [
+          [iso(AUG_23 + 1000), { roll: 1, pitch: 1 }],
+          [iso(AUG_23 + 2000), { roll: 2 }],
+        ],
+        aggregate,
+      );
+      assert.equal(answer.values[0].method, aggregate);
+    }
+  });
+
+  it("keeps the middle delta whole for middle_index", async () => {
+    attitude(AUG_23 + 1000, { roll: 1 });
+    attitude(AUG_23 + 2000, { roll: 2, pitch: 2 });
+    attitude(AUG_23 + 3000, { roll: 3 });
+
+    for (const resolution of [undefined, 10]) {
+      const answer = await history.getValues(
+        ask({
+          pathSpecs: [spec("navigation.attitude", "middle_index")],
+          ...(resolution === undefined ? {} : { resolution }),
+        }),
+      );
+
+      assert.deepEqual(answer.data, [
+        [iso(AUG_23 + 1000), null],
+        [iso(AUG_23 + 2000), { roll: 2, pitch: 2 }],
+        [iso(AUG_23 + 3000), null],
+      ]);
+    }
+  });
+
+  it("refuses a downsampled arithmetic aggregate", async () => {
+    attitude(AUG_23 + 1000, { roll: 1 });
+
+    for (const aggregate of ["average", "min", "max", "mid", "bogus"]) {
+      await assert.rejects(
+        history.getValues(
+          ask({
+            pathSpecs: [spec("navigation.attitude", aggregate)],
+            resolution: 10,
+          }),
+        ),
+        (err: Error) => refusal(aggregate).test(String(err)),
+      );
+    }
+  });
+
+  it("refuses smoothing with or without a resolution", async () => {
+    attitude(AUG_23 + 1000, { roll: 1 });
+
+    for (const aggregate of ["sma", "ema"]) {
+      for (const resolution of [undefined, 10]) {
+        await assert.rejects(
+          history.getValues(
+            ask({
+              pathSpecs: [spec("navigation.attitude", aggregate)],
+              ...(resolution === undefined ? {} : { resolution }),
+            }),
+          ),
+          (err: Error) => refusal(aggregate).test(String(err)),
+        );
+      }
+    }
+  });
+
+  it("never refuses a path with no field rows", async () => {
+    record(sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }));
+
+    for (const aggregate of ["average", "sma"]) {
+      const answer = await history.getValues(
+        ask({
+          pathSpecs: [
+            spec("a.b", aggregate),
+            spec("navigation.attitude", aggregate),
+          ],
+          resolution: 10,
+        }),
+      );
+      assert.equal(answer.data.length, 1, aggregate);
+    }
+  });
+});
+
 describe("an answer that did not fit", () => {
   it("refuses it rather than serving the range with its end cut off", async () => {
     // The reader's own ceiling is on the answer, and a request's ceilings are
@@ -399,6 +587,8 @@ describe("getPaths and getContexts", { skip: NO_BUNDLED_EXTENSION }, () => {
       sample({ ts: AUG_23 + 1000, path: "a.b" }),
       sample({ ts: AUG_23 + 1000, path: "c.d", context: "vessels.urn:x" }),
       sample({ ts: AUG_23 + 2 * DAY, path: "later.path" }),
+      sample({ ts: AUG_23 + 1000, path: "navigation.attitude#/roll" }),
+      sample({ ts: AUG_23 + 1000, path: "navigation.attitude#/pitch" }),
     );
 
     const range = {
@@ -406,7 +596,12 @@ describe("getPaths and getContexts", { skip: NO_BUNDLED_EXTENSION }, () => {
       to: instant(AUG_23 + DAY),
     } as never;
 
-    assert.deepEqual(await history.getPaths(range), ["a.b", "c.d"]);
+    // An object path once, never its fields' pointer names.
+    assert.deepEqual(await history.getPaths(range), [
+      "a.b",
+      "c.d",
+      "navigation.attitude",
+    ]);
     assert.deepEqual(await history.getContexts(range), [
       "vessels.self",
       "vessels.urn:x",

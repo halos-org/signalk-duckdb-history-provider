@@ -1,7 +1,7 @@
 import { Socket } from "node:net";
 import { FrameDecoder, ProtocolError, encodeFrame } from "./protocol.js";
-import type { Message, Sample } from "./protocol.js";
-import type { FlushBuffer } from "../flush-buffer.js";
+import type { Message } from "./protocol.js";
+import type { DeltaSamples, FlushBuffer } from "../flush-buffer.js";
 
 /**
  * The plugin's side of the socket.
@@ -87,8 +87,15 @@ export class WriterClient {
   private consecutiveFlaps = 0;
   private unhealthy = false;
   private seq = 0;
-  /** The batch on the wire, kept until the writer confirms it. */
-  private inFlight: { seq: number; samples: Sample[] } | null = null;
+  /**
+   * The batch on the wire, kept until the writer confirms it — as deltas, so a
+   * requeue puts each back whole.
+   */
+  private inFlight: {
+    seq: number;
+    deltas: DeltaSamples[];
+    samples: number;
+  } | null = null;
   private acked = 0;
   private stored = 0;
   /** Samples thrown away because they could not be framed. Counted, not silent. */
@@ -132,10 +139,10 @@ export class WriterClient {
     this.openSocket();
   }
 
-  /** Buffers a sample. Flushes at once if that completed a batch. */
-  add(sample: Sample): void {
+  /** Buffers one delta's samples. Flushes at once if that completed a batch. */
+  add(delta: DeltaSamples): void {
     const now = this.options.now();
-    this.options.buffer.add(sample, now);
+    this.options.buffer.add(delta, now);
     if (this.options.buffer.isDue(now)) this.pump();
   }
 
@@ -163,12 +170,7 @@ export class WriterClient {
 
   private forcePump(): void {
     const now = this.options.now();
-    const samples = this.options.buffer.take(now);
-    if (samples.length === 0) return;
-    this.seq++;
-    this.inFlight = { seq: this.seq, samples };
-    this.send({ type: "batch", seq: this.seq, samples });
-    this.armAckTimer();
+    this.sendBatch(this.options.buffer.take(now));
   }
 
   async stop(): Promise<void> {
@@ -310,7 +312,7 @@ export class WriterClient {
         if (this.inFlight !== null && this.inFlight.seq === message.seq) {
           // Back to the buffer rather than discarded: the writer said it did
           // not store this, so losing it here would be loss the plugin chose.
-          this.options.buffer.requeue(this.inFlight.samples);
+          this.options.buffer.requeue(this.inFlight.deltas);
           this.inFlight = null;
         }
         this.markUnhealthy(message.message);
@@ -336,11 +338,11 @@ export class WriterClient {
     this.inFlight = null;
     if (pending.seq <= writerLastSeq) {
       this.acked++;
-      this.stored += pending.samples.length;
+      this.stored += pending.samples;
       this.options.log(`batch ${pending.seq} had landed before the drop`);
       return;
     }
-    this.options.buffer.requeue(pending.samples);
+    this.options.buffer.requeue(pending.deltas);
   }
 
   private pump(): void {
@@ -348,10 +350,14 @@ export class WriterClient {
     const now = this.options.now();
     if (!this.options.buffer.isDue(now)) return;
 
-    const samples = this.options.buffer.take(now);
-    if (samples.length === 0) return;
+    this.sendBatch(this.options.buffer.take(now));
+  }
+
+  private sendBatch(deltas: DeltaSamples[]): void {
+    if (deltas.length === 0) return;
+    const samples = deltas.flat();
     this.seq++;
-    this.inFlight = { seq: this.seq, samples };
+    this.inFlight = { seq: this.seq, deltas, samples: samples.length };
     this.send({ type: "batch", seq: this.seq, samples });
     this.armAckTimer();
   }
@@ -374,7 +380,7 @@ export class WriterClient {
       // is deterministic: the batch that did not fit will never fit. So they
       // are discarded and counted, which is the honest half of the trade, and
       // the plugin is told.
-      const lost = this.inFlight.samples.length;
+      const lost = this.inFlight.samples;
       this.inFlight = null;
       this.discarded += lost;
       this.markUnhealthy(

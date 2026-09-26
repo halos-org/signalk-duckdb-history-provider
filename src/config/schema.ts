@@ -67,13 +67,13 @@ export const ConfigSchema = Type.Object({
     default: 1000,
     title: "Flush batch size (samples)",
     description:
-      "Samples per write. Reaching it flushes early, whatever the interval says. Each batch is one SQLite transaction.",
+      "Samples per write. Reaching it flushes early, whatever the interval says. Each batch is one SQLite transaction, and a delta is never split across two; a delta larger than the batch size is written alone.",
   }),
   maxBufferMB: Type.Number({
     default: 8,
     title: "Buffer ceiling while the writer is unreachable (MB)",
     description:
-      "Memory held for samples that could not be sent. When it is full the oldest are dropped, and the count is reported in the plugin status.",
+      "Memory held for samples that could not be sent. When it is full the oldest deltas are dropped whole, and the sample count is reported in the plugin status.",
   }),
 
   dataDir: Type.String({

@@ -371,6 +371,10 @@ describe("what a query reads", { skip: NO_BUNDLED_EXTENSION }, () => {
     record(sample({ ts: AUG_23 + 2000, path: "c.d", context: "other" }));
     store.deleteThrough(await rollAll(1));
     series(AUG_23 + 60_000, 1, "e.f");
+    record(
+      sample({ ts: AUG_23 + 61_000, path: "g.h#/x" }),
+      sample({ ts: AUG_23 + 61_000, path: "g.h#/y" }),
+    );
 
     const paths = await runner.run({
       kind: "paths",
@@ -384,7 +388,8 @@ describe("what a query reads", { skip: NO_BUNDLED_EXTENSION }, () => {
       to: AUG_23 + DAY,
     });
 
-    assert.deepEqual(paths.rows, [["a.b"], ["e.f"]]);
+    // A field is listed under its object's path, once.
+    assert.deepEqual(paths.rows, [["a.b"], ["e.f"], ["g.h"]]);
     assert.deepEqual(contexts.rows, [["other"], ["self"]]);
   });
 
@@ -696,6 +701,280 @@ describe("a values query", { skip: NO_BUNDLED_EXTENSION }, () => {
     );
   });
 });
+
+describe(
+  "a values query for an object path",
+  { skip: NO_BUNDLED_EXTENSION },
+  () => {
+    const OBJ = 7;
+    const values = (over: Partial<QueryRequest> = {}) =>
+      ({
+        kind: "values",
+        from: AUG_23,
+        to: AUG_23 + DAY,
+        context: "self",
+        bucketMs: 10_000,
+        specs: [{ path: "navigation.attitude", aggregate: "last" }],
+        ...over,
+      }) as QueryRequest;
+
+    /** One attitude delta: every field shares its ts and source. */
+    function attitude(
+      ts: number,
+      fields: Record<string, number>,
+      source: string | null = "n2k.0",
+    ): void {
+      record(
+        ...Object.entries(fields).map(([key, value]) =>
+          sample({ ts, path: `navigation.attitude#/${key}`, source, value }),
+        ),
+      );
+    }
+
+    /** The object column of each row, fields sorted by key. */
+    function objects(result: QueryResult): unknown[] {
+      return result.rows.map((row) => {
+        const fields = row[OBJ] as { key: string; num: number | null }[] | null;
+        return fields === null
+          ? null
+          : [...fields]
+              .sort((a, b) => a.key.localeCompare(b.key))
+              .map((field) => [field.key, field.num]);
+      });
+    }
+
+    it("takes the latest delta in the bucket whole for last", async () => {
+      attitude(AUG_23 + 1000, { roll: 1, pitch: 1, yaw: 1 });
+      attitude(AUG_23 + 5000, { roll: 5, pitch: 5 });
+      attitude(AUG_23 + 3000, { roll: 3, pitch: 3, yaw: 3 });
+
+      const result = await runner.run(values());
+
+      assert.deepEqual(
+        result.rows.map((row) => [row[0], row[1]]),
+        [[0, AUG_23]],
+      );
+      // yaw is absent from the chosen delta, so it is omitted rather than taken
+      // from an earlier one.
+      assert.deepEqual(objects(result), [
+        [
+          ["pitch", 5],
+          ["roll", 5],
+        ],
+      ]);
+    });
+
+    it("never mixes the fields of two sources' deltas in one millisecond", async () => {
+      // Which of the two is kept is not specified; that it is one of them is.
+      attitude(AUG_23 + 1000, { roll: 1, pitch: 1 }, "gps.1");
+      attitude(AUG_23 + 1000, { roll: 2, pitch: 2 }, "gps.2");
+
+      for (const aggregate of ["first", "last"] as const) {
+        const result = await runner.run(
+          values({ specs: [{ path: "navigation.attitude", aggregate }] }),
+        );
+        const [fields] = objects(result) as [string, number][][];
+        assert.equal(fields.length, 2, aggregate);
+        assert.equal(fields[0][1], fields[1][1], aggregate);
+      }
+    });
+
+    it("takes the earliest delta in the bucket whole for first", async () => {
+      attitude(AUG_23 + 5000, { roll: 5, pitch: 5, yaw: 5 });
+      attitude(AUG_23 + 1000, { roll: 1, pitch: 1 });
+
+      const result = await runner.run(
+        values({
+          specs: [{ path: "navigation.attitude", aggregate: "first" }],
+        }),
+      );
+
+      assert.deepEqual(objects(result), [
+        [
+          ["pitch", 1],
+          ["roll", 1],
+        ],
+      ]);
+    });
+
+    it("picks a delta whose source is null", async () => {
+      attitude(AUG_23 + 1000, { roll: 1, pitch: 1 }, null);
+      attitude(AUG_23 + 5000, { roll: 5, yaw: 5 }, null);
+
+      const pick = async (aggregate: "first" | "last") =>
+        objects(
+          await runner.run(
+            values({ specs: [{ path: "navigation.attitude", aggregate }] }),
+          ),
+        );
+
+      assert.deepEqual(await pick("first"), [
+        [
+          ["pitch", 1],
+          ["roll", 1],
+        ],
+      ]);
+      assert.deepEqual(await pick("last"), [
+        [
+          ["roll", 5],
+          ["yaw", 5],
+        ],
+      ]);
+    });
+
+    it("reads one delta per bucket across the tree and the store", async () => {
+      attitude(AUG_23 + 1000, { roll: 1, pitch: 1 });
+      store.deleteThrough(await rollAll(1));
+      attitude(AUG_23 + 25_000, { roll: 2, pitch: 2 });
+
+      const result = await runner.run(values());
+
+      assert.deepEqual(
+        result.rows.map((row) => row[1]),
+        [AUG_23, AUG_23 + 20_000],
+      );
+      assert.deepEqual(objects(result), [
+        [
+          ["pitch", 1],
+          ["roll", 1],
+        ],
+        [
+          ["pitch", 2],
+          ["roll", 2],
+        ],
+      ]);
+    });
+
+    it("returns one row per delta read raw, and limits deltas, not rows", async () => {
+      for (let i = 0; i < 4; i += 1) {
+        attitude(AUG_23 + i * 1000, { roll: i, pitch: i, yaw: i });
+      }
+
+      const result = await runner.run(
+        values({
+          specs: [{ path: "navigation.attitude", aggregate: "raw" }],
+          limit: 2,
+        }),
+      );
+
+      assert.deepEqual(
+        result.rows.map((row) => row[1]),
+        [AUG_23, AUG_23 + 1000],
+      );
+      assert.deepEqual(objects(result)[1], [
+        ["pitch", 1],
+        ["roll", 1],
+        ["yaw", 1],
+      ]);
+    });
+
+    it("keeps the key as it was stored, escaped", async () => {
+      record(sample({ ts: AUG_23 + 1000, path: "a.b#/x~1y", value: 1 }));
+
+      const result = await runner.run(
+        values({ specs: [{ path: "a.b", aggregate: "last" }] }),
+      );
+
+      assert.deepEqual(objects(result), [[["x~1y", 1]]]);
+    });
+
+    it("carries a text field and its kind", async () => {
+      record(
+        sample({
+          ts: AUG_23 + 1000,
+          path: "notifications.mob#/state",
+          kind: "string",
+          value: "emergency",
+        }),
+        sample({
+          ts: AUG_23 + 1000,
+          path: "notifications.mob#/silenced",
+          kind: "boolean",
+          value: "true",
+        }),
+      );
+
+      const result = await runner.run(
+        values({ specs: [{ path: "notifications.mob", aggregate: "last" }] }),
+      );
+
+      const fields = result.rows[0][OBJ] as {
+        key: string;
+        str: string;
+        kind: string;
+      }[];
+      assert.deepEqual(
+        fields
+          .map((f) => [f.key, f.str, f.kind])
+          .sort((a, b) => a[0].localeCompare(b[0])),
+        [
+          ["silenced", "true", "boolean"],
+          ["state", "emergency", "string"],
+        ],
+      );
+    });
+
+    it("restricts an object to one source when asked", async () => {
+      attitude(AUG_23 + 1000, { roll: 1 }, "n2k.0");
+      attitude(AUG_23 + 2000, { roll: 2 }, "n2k.9");
+
+      const result = await runner.run(
+        values({
+          specs: [
+            {
+              path: "navigation.attitude",
+              aggregate: "last",
+              sourceRef: "n2k.0",
+            },
+          ],
+        }),
+      );
+
+      assert.deepEqual(objects(result), [[["roll", 1]]]);
+    });
+
+    it("answers the scalar series when a path has both kinds of row", async () => {
+      record(
+        sample({ ts: AUG_23 + 1000, path: "a.b", value: 7 }),
+        sample({ ts: AUG_23 + 2000, path: "a.b#/c", value: 8 }),
+      );
+
+      const result = await runner.run(
+        values({ specs: [{ path: "a.b", aggregate: "last" }] }),
+      );
+
+      assert.deepEqual(
+        result.rows.map((row) => [row[2], row[OBJ]]),
+        [[7, null]],
+      );
+    });
+
+    it("marks an object path with one fieldless row for an averaging aggregate", async () => {
+      // Nothing is averaged per field; the caller refuses the request, and needs
+      // only to know the path is an object.
+      attitude(AUG_23 + 1000, { roll: 1 });
+      attitude(AUG_23 + 25_000, { roll: 2 });
+
+      const result = await runner.run(
+        values({
+          specs: [{ path: "navigation.attitude", aggregate: "average" }],
+        }),
+      );
+
+      assert.deepEqual(objects(result), [[]]);
+    });
+
+    it("returns no object column for a scalar path", async () => {
+      record(sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }));
+
+      const result = await runner.run(
+        values({ specs: [{ path: "a.b", aggregate: "average" }] }),
+      );
+
+      assert.deepEqual(objects(result), [null]);
+    });
+  },
+);
 
 describe("the tree's file selection", () => {
   it("keeps the dates that intersect the range and no others", async () => {

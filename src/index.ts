@@ -316,7 +316,7 @@ export default (app: App) => {
         recorder = new Recorder({
           config,
           selfContext: app.selfContext,
-          emit: (sample) => client?.add(sample),
+          emit: (delta) => client?.add(delta),
           log: (line) => app.error(line),
         });
         unsubscribe = app.streambundle

@@ -5,6 +5,7 @@ import {
 } from "./delta-routing.js";
 import { PathMatcher, RateMatcher, Throttle } from "./path-matcher.js";
 import type { Config } from "./config/schema.js";
+import type { DeltaSamples } from "./flush-buffer.js";
 import type { Sample } from "./writer/protocol.js";
 
 /**
@@ -22,13 +23,16 @@ export interface BusValue {
   value: unknown;
   context: string;
   $source?: unknown;
+  /** Set by the server on metadata (`NormalizedMetaDelta`), which is not history. */
+  isMeta?: boolean;
 }
 
 export interface RecorderOptions {
   config: Config;
   /** `app.selfContext`, so own-vessel values can be told from AIS targets. */
   selfContext: string;
-  emit: (sample: Sample) => void;
+  /** Called once per recorded delta, with every sample it produced. */
+  emit: (delta: DeltaSamples) => void;
   now?: () => number;
   log?: (message: string) => void;
 }
@@ -61,7 +65,7 @@ export const SELF_CONTEXT = "self";
 export class Recorder {
   private readonly config: Config;
   private readonly selfContext: string;
-  private readonly emit: (sample: Sample) => void;
+  private readonly emit: (delta: DeltaSamples) => void;
   private readonly now: () => number;
   private readonly log: (message: string) => void;
 
@@ -99,6 +103,8 @@ export class Recorder {
   }
 
   handle(item: BusValue): void {
+    if (item.isMeta === true) return;
+
     // The delta's sourceRef, kept so interleaved multi-source streams (two GPS
     // receivers) can be told apart afterwards and filtered through the history
     // API's `path|sourceRef` syntax.
@@ -127,14 +133,16 @@ export class Recorder {
       if (this.lastNameByContext.get(context) === name) return;
       if (!this.admitContext(context)) return;
       this.lastNameByContext.set(context, name);
-      this.record({
-        ts: this.now(),
-        context,
-        path: "name",
-        source,
-        kind: "identity",
-        value: name,
-      });
+      this.record([
+        {
+          ts: this.now(),
+          context,
+          path: "name",
+          source,
+          kind: "identity",
+          value: name,
+        },
+      ]);
       return;
     }
 
@@ -142,72 +150,54 @@ export class Recorder {
     if (isSelf && !this.config.recordSelf) return;
     if (!isSelf && !this.config.recordOthers) return;
 
-    // Routed once, before the gates, because an object value is gated on its
-    // leaf paths instead. Applying the parent's gates to those would be wrong
-    // twice over: an include-filter naming only `navigation.attitude.roll`
-    // would drop the parent before any leaf was seen, and the parent would
-    // consume a throttle slot the leaves then wait out again, halving the
-    // effective sampling rate.
     const route = routeDeltaValue(item.path, item.value);
     if (route === null) return;
 
     const ts = this.now();
     if (route === "flatten") {
-      for (const leaf of flattenObjectValue(item.path, item.value)) {
-        this.recordScalar(ts, context, leaf.path, source, leaf.value);
-      }
+      // An object is one Signal K path, so it is gated once, on that path: the
+      // filter, the sampling rate and the path cap all see
+      // `navigation.attitude`, never a field of it. Gating each field instead
+      // would let a filter or a throttle keep half of an object.
+      const leaves = flattenObjectValue(item.path, item.value);
+      if (leaves.length === 0) return;
+      if (!this.admit(item.path, context)) return;
+      this.record(
+        leaves.map((leaf) =>
+          scalarSample(ts, context, leaf.path, source, leaf.value),
+        ),
+      );
       return;
     }
     if (route === "position") {
       if (!this.admit(item.path, context)) return;
-      this.record({
-        ts,
-        context,
-        path: item.path,
-        source,
-        kind: "position",
-        value: item.value as { latitude: number; longitude: number },
-      });
+      this.record([
+        {
+          ts,
+          context,
+          path: item.path,
+          source,
+          kind: "position",
+          value: item.value as { latitude: number; longitude: number },
+        },
+      ]);
       return;
     }
-    this.recordScalar(
-      ts,
-      context,
-      item.path,
-      source,
-      item.value as number | string | boolean,
-    );
-  }
-
-  private recordScalar(
-    ts: number,
-    context: string,
-    path: string,
-    source: string | null,
-    value: number | string | boolean,
-  ): void {
-    if (!this.admit(path, context)) return;
-    if (typeof value === "number") {
-      this.record({ ts, context, path, source, kind: "number", value });
-    } else if (typeof value === "boolean") {
-      // The text, under the boolean kind. A 1.0 double cannot be told apart
-      // from a real numeric channel on the way back out; the kind can.
-      this.record({
+    if (!this.admit(item.path, context)) return;
+    this.record([
+      scalarSample(
         ts,
         context,
-        path,
+        item.path,
         source,
-        kind: "boolean",
-        value: value ? "true" : "false",
-      });
-    } else {
-      this.record({ ts, context, path, source, kind: "string", value });
-    }
+        item.value as number | string | boolean,
+      ),
+    ]);
   }
 
-  private record(sample: Sample): void {
-    this.recorded++;
-    this.emit(sample);
+  private record(delta: DeltaSamples): void {
+    this.recorded += delta.length;
+    this.emit(delta);
   }
 
   /** Path filter, cardinality caps and rate cap, in the order that costs least. */
@@ -279,4 +269,29 @@ export class Recorder {
           : ""),
     );
   }
+}
+
+function scalarSample(
+  ts: number,
+  context: string,
+  path: string,
+  source: string | null,
+  value: number | string | boolean,
+): Sample {
+  if (typeof value === "number") {
+    return { ts, context, path, source, kind: "number", value };
+  }
+  // The text, under the boolean kind. A 1.0 double cannot be told apart from
+  // a real numeric channel on the way back out; the kind can.
+  if (typeof value === "boolean") {
+    return {
+      ts,
+      context,
+      path,
+      source,
+      kind: "boolean",
+      value: value ? "true" : "false",
+    };
+  }
+  return { ts, context, path, source, kind: "string", value };
 }

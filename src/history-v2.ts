@@ -8,8 +8,10 @@ import type {
   ValuesRequest,
   ValuesResponse,
 } from "@signalk/server-api/history";
+import { fieldKey, setField } from "./pointer.js";
+import type { ObjectValue } from "./pointer.js";
 import { DEFAULT_ROW_LIMIT, QueryRunner, VALUE_COLUMNS } from "./query/duck.js";
-import type { ValueAggregate, ValueSpec } from "./query/duck.js";
+import type { ObjectField, ValueAggregate, ValueSpec } from "./query/duck.js";
 import { resolveTimeRange } from "./time-range.js";
 
 /**
@@ -166,6 +168,26 @@ function normalizeContext(context: string, selfContext: string): string {
   return context;
 }
 
+/**
+ * Whether an object path may be read with this aggregate.
+ *
+ * An aggregate on an object applies to the object as a whole, and a per-field
+ * average has no general meaning — an angle, a vector component and a
+ * coordinate average differently, and nothing here says which a field is. So
+ * an object takes only the aggregates that select a recorded delta, and a
+ * read without a resolution, which returns every delta as recorded.
+ * Smoothing is refused either way: it would average across deltas too.
+ */
+function appliesToObject(aggregate: string, bucketed: boolean): boolean {
+  if (aggregate === "sma" || aggregate === "ema") return false;
+  if (!bucketed) return true;
+  return (
+    aggregate === "first" ||
+    aggregate === "last" ||
+    aggregate === "middle_index"
+  );
+}
+
 /** One row of the query layer's `values` answer. */
 interface ValueRow {
   spec: number;
@@ -175,6 +197,7 @@ interface ValueRow {
   kind: string | null;
   lat: number | null;
   lon: number | null;
+  obj: ObjectField[] | null;
 }
 
 /** Where each value lives in a row, from the order the query layer declares. */
@@ -191,6 +214,7 @@ function toValueRow(row: unknown[]): ValueRow {
     kind: (row[AT.kind] as string | null) ?? null,
     lat: (row[AT.lat] as number | null) ?? null,
     lon: (row[AT.lon] as number | null) ?? null,
+    obj: (row[AT.obj] as ObjectField[] | null) ?? null,
   };
 }
 
@@ -202,12 +226,31 @@ function toValueRow(row: unknown[]): ValueRow {
  * real booleans so the same path reads the same through both API versions.
  */
 function decode(row: ValueRow): unknown {
+  if (row.obj !== null) return decodeObject(row.obj);
   if (row.lat !== null && row.lon !== null) {
     return { latitude: row.lat, longitude: row.lon };
   }
-  if (row.num !== null) return row.num;
-  if (row.str === null) return null;
-  return row.kind === "boolean" ? row.str === "true" : row.str;
+  return scalar(row.num, row.str, row.kind);
+}
+
+function scalar(
+  num: number | null,
+  str: string | null,
+  kind: string | null,
+): number | string | boolean | null {
+  if (num !== null) return num;
+  if (str === null) return null;
+  return kind === "boolean" ? str === "true" : str;
+}
+
+/** The fields of one delta, keyed by name. A field with no value is omitted. */
+function decodeObject(fields: ObjectField[]): ObjectValue {
+  const value: ObjectValue = {};
+  for (const field of fields) {
+    const leaf = scalar(field.num, field.str, field.kind);
+    if (leaf !== null) setField(value, fieldKey(field.key), leaf);
+  }
+  return value;
 }
 
 export function createHistoryV2(
@@ -295,6 +338,7 @@ export function createHistoryV2(
     // path-keyed map would let the second overwrite the first.
     const bySpec = new Map<number, Map<number, unknown>>();
     const fromText = new Set<number>();
+    const objects = new Set<number>();
     let firstBucket = Infinity;
     let lastBucket = -Infinity;
 
@@ -315,9 +359,22 @@ export function createHistoryV2(
       bySpec.set(row.spec, series);
       series.set(row.bucket, decode(row));
       if (row.num === null && row.str !== null) fromText.add(row.spec);
+      if (row.obj !== null) objects.add(row.spec);
       if (!onGrid.has(row.spec)) continue;
       if (row.bucket < firstBucket) firstBucket = row.bucket;
       if (row.bucket > lastBucket) lastBucket = row.bucket;
+    }
+
+    // After the query rather than before it: whether a path is an object is
+    // known only from its rows, and the request is one statement.
+    for (const index of objects) {
+      const { aggregate, path } = query.pathSpecs[index];
+      if (!appliesToObject(aggregate, bucketSeconds > 0)) {
+        throw new Error(
+          `Aggregate ${aggregate} does not apply to object path ${path}: ` +
+            `use first, last or middle_index`,
+        );
+      }
     }
 
     // The client-side aggregates run over their series' raw rows, in order.
@@ -326,6 +383,17 @@ export function createHistoryV2(
       const series = bySpec.get(index);
       if (series === undefined) continue;
       const stamps = [...series.keys()].sort((a, b) => a - b);
+      if (objects.has(index)) {
+        // Only middle_index is left for an object: the middle delta, whole.
+        const middle = stamps[Math.floor(stamps.length / 2)];
+        bySpec.set(
+          index,
+          new Map(
+            stamps.map((ts) => [ts, ts === middle ? series.get(ts) : null]),
+          ),
+        );
+        continue;
+      }
       const numbers = stamps.map((ts) => {
         const value = series.get(ts);
         return typeof value === "number" ? value : null;

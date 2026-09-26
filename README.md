@@ -115,8 +115,8 @@ Every option is rendered in the Signal K Admin UI from the plugin's own schema
 | Maximum distinct recorded paths                     | `2000`                | Paths beyond this are ignored, so a misbehaving source cannot inflate the partition count without limit.                                                                                                                                                                                                               |
 | Maximum distinct recorded contexts                  | `100`                 | The same bound for vessel contexts.                                                                                                                                                                                                                                                                                    |
 | Flush interval (ms)                                 | `5000`                | No sample waits longer than this before reaching the writer. Also the crash-loss window: a hard power cut loses at most this much.                                                                                                                                                                                     |
-| Flush batch size (samples)                          | `1000`                | Samples per write, whichever comes first with the interval. Each batch is one SQLite transaction.                                                                                                                                                                                                                      |
-| Buffer ceiling while the writer is unreachable (MB) | `8`                   | Memory held for samples that could not be sent. When full the oldest are dropped and the count is reported in the plugin status.                                                                                                                                                                                       |
+| Flush batch size (samples)                          | `1000`                | Samples per write, whichever comes first with the interval. Each batch is one SQLite transaction, and a delta is never split across two; a delta larger than the batch size is written alone.                                                                                                                          |
+| Buffer ceiling while the writer is unreachable (MB) | `8`                   | Memory held for samples that could not be sent. When full the oldest deltas are dropped whole and the sample count is reported in the plugin status.                                                                                                                                                                   |
 | Data directory                                      | plugin data directory | Where the hot store and the Parquet tree live. A relative value resolves against the plugin's own directory.                                                                                                                                                                                                           |
 | Retention (days, 0 = keep forever)                  | `0`                   | A bound on what is stored, not a promise that everything older is deleted. Whole UTC days are dropped once the window has passed them, so the oldest sample kept can be up to a day older than the boundary. Applied after each roll.                                                                                  |
 | Roll interval (minutes)                             | `5`                   | How often the hot store becomes Parquet and is truncated. Shorter keeps the hot store small at the cost of more Parquet files, and the hot store's size is what every query touching recent time pays for. Must divide 1440 — the schedule runs every N minutes from UTC midnight — and anything else falls back to 5. |
@@ -142,6 +142,62 @@ one by hand.
 older than this one: those builds read every file in a date directory, and
 between a merge's rename and the removal of its inputs that counts the hour
 twice.
+
+## Object values
+
+**Recording.** An object value such as `navigation.attitude` is stored one row
+per scalar field under a pointer name, `<path>#/<field>` — for example
+`navigation.attitude#/roll` — and every field of one delta shares one
+timestamp. A `/` or `~` in a field name is escaped as `~1` or `~0`. Nested
+objects, arrays, nulls and non-finite numbers inside the object are skipped.
+`navigation.position` is still stored as a position, and a position missing a
+finite latitude or longitude is not recorded at all. Meta updates (units,
+descriptions, display names) are not recorded.
+
+The path filter, the sampling rate and the path cap act on the object's own
+path, as one unit: every field of a delta is stored, or none is, and the object
+counts once against **Maximum distinct recorded paths**. A pattern that names a
+field (`navigation.attitude.roll`), or a glob that matches only fields
+(`navigation.attitude.*`), no longer matches anything of that object; edit such
+entries to name `navigation.attitude`. Broad globs such as `navigation.*` keep
+working.
+
+**Reading, v2.** Ask for the object's own path —
+`paths=navigation.attitude:last` — and each bucket holds
+`{ "roll": ..., "pitch": ..., "yaw": ... }`; `/paths` lists
+`navigation.attitude` once and never a pointer name. An aggregate applies to
+the object as a whole, so an object path only takes the methods that pick a
+recorded delta:
+
+- `first` and `last` take one whole delta, the one with the earliest or latest
+  timestamp in the bucket, so the fields belong together. A field with no value
+  in that delta is left out; a bucket with no data at all is `null`.
+- `middle_index` returns the middle delta whole.
+- Without `resolution` each delta is one object. A request that names no method
+  is read this way, and its `method` reads `average` because the server fills
+  that name in.
+- With `resolution`, `average`, `min`, `max` and `mid` fail the request with
+  `Aggregate average does not apply to object path navigation.attitude: use first, last or middle_index`,
+  which the server answers with HTTP 400, and so do `sma` and `ema` with or
+  without it. The plugin cannot tell whether a field is an angle, a vector
+  component or a coordinate, so averaging each field on its own would return a
+  plausible wrong value.
+
+When a path has plain values as well as object fields in the range, the plain
+values are returned. Timestamps are whole milliseconds, so two deltas from one
+source stamped in the same millisecond read back as one.
+
+**Reading, v1.** Playback replays each delta as one object at its own path, as
+the live stream carried it. A snapshot holds each object's newest value of
+every field, so its fields can come from different deltas; it carries the time
+and source of the newest one.
+
+**Upgrading.** Earlier builds stored object fields under dotted names such as
+`navigation.attitude.roll`. Those rows stay where they are and stay queryable
+under those names, but they are not served at the object path, and a query for
+a dotted field gets no data recorded since the upgrade: new data is only
+reachable through the object path. A rename of the old rows, if wanted, is
+[signalk-duckdb-history-provider#41](https://github.com/halos-org/signalk-duckdb-history-provider/issues/41).
 
 ## The bundled DuckDB extension
 
