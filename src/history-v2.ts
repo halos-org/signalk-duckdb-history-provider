@@ -188,6 +188,50 @@ function appliesToObject(aggregate: string, bucketed: boolean): boolean {
   );
 }
 
+/**
+ * Refuses a request whose series would lay out more than the bucket ceiling.
+ *
+ * Counted on the range the caller asked for rather than on what comes back —
+ * a budget that only refuses after the work is done is not a budget. Only
+ * specs that bucket contribute: a client-side aggregate reads raw rows under
+ * their own limit.
+ */
+function guardBuckets(
+  specs: PathSpec[],
+  resolution: number,
+  bucketSeconds: number,
+  rangeMs: number,
+): void {
+  const bucketedSpecs = specs.filter(
+    (spec) => !needsClientSideAggregation(spec.aggregate),
+  ).length;
+  if (bucketSeconds <= 0 || bucketedSpecs === 0) return;
+  const buckets = Math.ceil(rangeMs / 1000 / bucketSeconds) * bucketedSpecs;
+  if (buckets > MAX_SAMPLE_BUCKETS) {
+    throw new Error(
+      `resolution ${resolution}s over this range produces up to ` +
+        `${buckets} buckets across ${bucketedSpecs} paths ` +
+        `(max ${MAX_SAMPLE_BUCKETS}) — use a coarser resolution or ` +
+        `a shorter range`,
+    );
+  }
+}
+
+/**
+ * One column of the answer. `source` is set on a column `sourcePolicy: all`
+ * split out: the source it reads, or null for the rows recorded without one.
+ */
+interface Column {
+  spec: PathSpec;
+  source?: string | null;
+}
+
+/** Named sources in order, the rows without a source last. */
+function orderSources(sources: (string | null)[]): (string | null)[] {
+  const named = sources.filter((s): s is string => s !== null).sort();
+  return sources.includes(null) ? [...named, null] : named;
+}
+
 /** One row of the query layer's `values` answer. */
 interface ValueRow {
   spec: number;
@@ -268,40 +312,40 @@ export function createHistoryV2(
     const resolution = query.resolution ?? 0;
     const bucketSeconds = resolution > 0 ? effectiveResolution(resolution) : 0;
 
-    // Before anything is queried, and counted on the range the caller asked
-    // for rather than on what comes back — a budget that only refuses after
-    // the work is done is not a budget. Only specs that bucket contribute: a
-    // client-side aggregate reads raw rows under their own limit.
-    const bucketedSpecs = query.pathSpecs.filter(
-      (spec: PathSpec) => !needsClientSideAggregation(spec.aggregate),
-    ).length;
-    if (bucketSeconds > 0 && bucketedSpecs > 0) {
-      const buckets =
-        Math.ceil((toMs - fromMs) / 1000 / bucketSeconds) * bucketedSpecs;
-      if (buckets > MAX_SAMPLE_BUCKETS) {
-        throw new Error(
-          `resolution ${resolution}s over this range produces up to ` +
-            `${buckets} buckets across ${bucketedSpecs} paths ` +
-            `(max ${MAX_SAMPLE_BUCKETS}) — use a coarser resolution or ` +
-            `a shorter range`,
-        );
-      }
-    }
+    guardBuckets(query.pathSpecs, resolution, bucketSeconds, toMs - fromMs);
 
     const requestedContext = query.context ?? "vessels.self";
-    const specs: ValueSpec[] = query.pathSpecs.map((spec: PathSpec) => ({
-      path: spec.path,
-      aggregate: toQueryAggregate(spec.aggregate),
-      ...(spec.sourceRef ? { sourceRef: spec.sourceRef } : {}),
-    }));
+    const context = normalizeContext(requestedContext, selfContext);
+    let columns: Column[] = query.pathSpecs.map((spec: PathSpec) => ({ spec }));
+    if (query.sourcePolicy === "all") {
+      columns = await splitBySource(query.pathSpecs, fromMs, toMs, context);
+      guardBuckets(
+        columns.map((column) => column.spec),
+        resolution,
+        bucketSeconds,
+        toMs - fromMs,
+      );
+    }
+    const pathSpecs = columns.map((column) => column.spec);
 
-    const values = query.pathSpecs.map((spec: PathSpec) => {
+    const specs: ValueSpec[] = columns.map(({ spec, source }) => {
+      const sourceRef =
+        source === undefined ? spec.sourceRef || undefined : source;
+      return {
+        path: spec.path,
+        aggregate: toQueryAggregate(spec.aggregate),
+        ...(sourceRef !== undefined ? { sourceRef } : {}),
+      };
+    });
+
+    const values = columns.map(({ spec, source }) => {
       const entry: {
         path: Path;
         method: AggregateMethod;
-        sourceRef?: SourceRef;
+        $source?: SourceRef;
       } = { path: spec.path, method: spec.aggregate };
-      if (spec.sourceRef) entry.sourceRef = spec.sourceRef;
+      const label = source === undefined ? spec.sourceRef || undefined : source;
+      if (typeof label === "string") entry.$source = label as SourceRef;
       return entry;
     });
 
@@ -313,7 +357,7 @@ export function createHistoryV2(
       kind: "values",
       from: fromMs,
       to: toMs,
-      context: normalizeContext(requestedContext, selfContext),
+      context,
       specs,
       ...(bucketSeconds > 0 ? { bucketMs: bucketSeconds * 1000 } : {}),
       limit: RAW_ROW_LIMIT,
@@ -347,7 +391,7 @@ export function createHistoryV2(
     // from one of those would land between boundaries at every step and
     // fabricate an all-null row for each.
     const onGrid = new Set(
-      query.pathSpecs
+      pathSpecs
         .map((spec: PathSpec, index: number) => ({ spec, index }))
         .filter(({ spec }) => !needsClientSideAggregation(spec.aggregate))
         .map(({ index }) => index),
@@ -368,7 +412,7 @@ export function createHistoryV2(
     // After the query rather than before it: whether a path is an object is
     // known only from its rows, and the request is one statement.
     for (const index of objects) {
-      const { aggregate, path } = query.pathSpecs[index];
+      const { aggregate, path } = pathSpecs[index];
       if (!appliesToObject(aggregate, bucketSeconds > 0)) {
         throw new Error(
           `Aggregate ${aggregate} does not apply to object path ${path}: ` +
@@ -378,7 +422,7 @@ export function createHistoryV2(
     }
 
     // The client-side aggregates run over their series' raw rows, in order.
-    for (const [index, spec] of query.pathSpecs.entries()) {
+    for (const [index, spec] of pathSpecs.entries()) {
       if (!needsClientSideAggregation(spec.aggregate)) continue;
       const series = bySpec.get(index);
       if (series === undefined) continue;
@@ -442,13 +486,63 @@ export function createHistoryV2(
         const row: [Timestamp, ...unknown[]] = [
           new Date(at).toISOString() as Timestamp,
         ];
-        for (let index = 0; index < query.pathSpecs.length; index += 1) {
+        for (let index = 0; index < pathSpecs.length; index += 1) {
           row.push(bySpec.get(index)?.get(at) ?? null);
         }
         return row;
       });
 
     return { context: requestedContext as Context, range, values, data };
+  }
+
+  /**
+   * `sourcePolicy: all`: each spec without a sourceRef becomes one column per
+   * source with rows of its path in the range, and a spec with a sourceRef
+   * stays a filter. A path with no rows gets no column. This is the one
+   * request that costs two statements: which sources exist has to be known
+   * before the series can be laid out.
+   */
+  async function splitBySource(
+    requested: PathSpec[],
+    from: number,
+    to: number,
+    context: string,
+  ): Promise<Column[]> {
+    const paths = [
+      ...new Set(
+        requested.filter((spec) => !spec.sourceRef).map((spec) => spec.path),
+      ),
+    ];
+    const sources = new Map<string, (string | null)[]>();
+    if (paths.length > 0) {
+      const answer = await runner.run({
+        kind: "sources",
+        from,
+        to,
+        context,
+        paths,
+      });
+      // A cut list would silently drop whole columns.
+      if (answer.truncated) {
+        throw new Error(
+          `these paths have more than ${DEFAULT_ROW_LIMIT} sources — name ` +
+            `the sources to read, or fewer paths`,
+        );
+      }
+      for (const [path, source] of answer.rows) {
+        const list = sources.get(path as string) ?? [];
+        list.push((source as string | null) ?? null);
+        sources.set(path as string, list);
+      }
+    }
+    return requested.flatMap((spec): Column[] =>
+      spec.sourceRef
+        ? [{ spec }]
+        : orderSources(sources.get(spec.path) ?? []).map((source) => ({
+            spec,
+            source,
+          })),
+    );
   }
 
   async function getPaths(query: PathsRequest): Promise<Path[]> {

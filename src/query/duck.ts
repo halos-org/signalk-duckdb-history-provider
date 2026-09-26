@@ -107,8 +107,11 @@ export type ValueAggregate =
 export interface ValueSpec {
   path: string;
   aggregate: ValueAggregate;
-  /** Restrict the series to rows recorded from this source. */
-  sourceRef?: string;
+  /**
+   * Restrict the series to rows recorded from this source, or with `null` to
+   * the rows recorded without one.
+   */
+  sourceRef?: string | null;
 }
 
 /**
@@ -182,6 +185,19 @@ export type QueryRequest =
       /** Absent lists every context's paths, which is what the v2 surface asks
        * for — its request carries a range and nothing else. */
       context?: string;
+    }
+  | {
+      /**
+       * Every `(path, source)` pair with rows in the range and context, an
+       * object's fields listed under its own path. What `sourcePolicy: all`
+       * splits a series by; `source` is null for rows recorded without one.
+       */
+      kind: "sources";
+      from: number;
+      to: number;
+      context: string;
+      /** The paths to list. A request naming none is not sent. */
+      paths: string[];
     }
   | { kind: "contexts"; from: number; to: number };
 

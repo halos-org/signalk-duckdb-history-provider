@@ -144,8 +144,8 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
 
     assert.deepEqual(answer.data, [[new Date(AUG_23).toISOString(), 1, 99]]);
     assert.deepEqual(answer.values, [
-      { path: "a.b", method: "average", sourceRef: "n2k.0" },
-      { path: "a.b", method: "average", sourceRef: "n2k.9" },
+      { path: "a.b", method: "average", $source: "n2k.0" },
+      { path: "a.b", method: "average", $source: "n2k.9" },
     ]);
   });
 
@@ -366,6 +366,216 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
   });
 });
 
+describe(
+  "getValues with sourcePolicy all",
+  { skip: NO_BUNDLED_EXTENSION },
+  () => {
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const all = (
+      over: Partial<ValuesRequest> & Pick<ValuesRequest, "pathSpecs">,
+      windowMs?: number,
+    ) => ask({ resolution: 10, ...over, sourcePolicy: "all" }, windowMs);
+
+    it("splits a path into one column per source, ordered by source", async () => {
+      record(
+        sample({ ts: AUG_23 + 1000, path: "a.b", source: "n2k.9", value: 9 }),
+        sample({ ts: AUG_23 + 2000, path: "a.b", source: "n2k.0", value: 1 }),
+        sample({ ts: AUG_23 + 3000, path: "c.d", source: "other", value: 5 }),
+      );
+
+      const answer = await history.getValues(all({ pathSpecs: [spec("a.b")] }));
+
+      assert.deepEqual(answer.values, [
+        { path: "a.b", method: "average", $source: "n2k.0" },
+        { path: "a.b", method: "average", $source: "n2k.9" },
+      ]);
+      assert.deepEqual(answer.data, [[iso(AUG_23), 1, 9]]);
+    });
+
+    it("keeps a spec that names a source as a filter", async () => {
+      record(
+        sample({ ts: AUG_23 + 1000, path: "a.b", source: "n2k.0", value: 1 }),
+        sample({ ts: AUG_23 + 2000, path: "a.b", source: "n2k.9", value: 9 }),
+      );
+
+      const answer = await history.getValues(
+        all({
+          pathSpecs: [
+            spec("a.b", "average", { sourceRef: "n2k.9" }),
+            spec("a.b"),
+          ],
+        }),
+      );
+
+      assert.deepEqual(
+        answer.values.map((v) => v.$source),
+        ["n2k.9", "n2k.0", "n2k.9"],
+      );
+      assert.deepEqual(answer.data, [[iso(AUG_23), 9, 1, 9]]);
+    });
+
+    it("gives rows without a source their own unlabelled column, last", async () => {
+      record(
+        sample({ ts: AUG_23 + 1000, path: "a.b", source: null, value: 7 }),
+        sample({ ts: AUG_23 + 2000, path: "a.b", source: "n2k.0", value: 1 }),
+      );
+
+      const answer = await history.getValues(all({ pathSpecs: [spec("a.b")] }));
+
+      assert.deepEqual(answer.values, [
+        { path: "a.b", method: "average", $source: "n2k.0" },
+        { path: "a.b", method: "average" },
+      ]);
+      assert.deepEqual(answer.data, [[iso(AUG_23), 1, 7]]);
+    });
+
+    it("gives a path with no rows no column", async () => {
+      record(sample({ ts: AUG_23 + 1000, path: "c.d", value: 5 }));
+
+      const answer = await history.getValues(
+        all({ pathSpecs: [spec("a.b"), spec("c.d")] }),
+      );
+
+      assert.deepEqual(answer.values, [
+        { path: "c.d", method: "average", $source: "n2k.0" },
+      ]);
+      assert.deepEqual(answer.data, [[iso(AUG_23), 5]]);
+    });
+
+    it("answers an empty response when no path has rows", async () => {
+      const answer = await history.getValues(all({ pathSpecs: [spec("a.b")] }));
+
+      assert.deepEqual(answer.values, []);
+      assert.deepEqual(answer.data, []);
+    });
+
+    it("splits an object path by the sources of its fields", async () => {
+      record(
+        sample({
+          ts: AUG_23 + 1000,
+          path: "navigation.attitude#/roll",
+          source: "a",
+          value: 1,
+        }),
+        sample({
+          ts: AUG_23 + 1000,
+          path: "navigation.attitude#/pitch",
+          source: "a",
+          value: 2,
+        }),
+      );
+      record(
+        sample({
+          ts: AUG_23 + 2000,
+          path: "navigation.attitude#/yaw",
+          source: "b",
+          value: 3,
+        }),
+      );
+
+      const answer = await history.getValues(
+        all({ pathSpecs: [spec("navigation.attitude", "last")] }),
+      );
+
+      assert.deepEqual(
+        answer.values.map((v) => v.$source),
+        ["a", "b"],
+      );
+      assert.deepEqual(answer.data, [
+        [iso(AUG_23), { roll: 1, pitch: 2 }, { yaw: 3 }],
+      ]);
+    });
+
+    it("splits the position path", async () => {
+      record(
+        sample({
+          ts: AUG_23 + 1000,
+          path: "navigation.position",
+          source: "gps.b",
+          kind: "position",
+          value: { latitude: 60, longitude: 24 },
+        }),
+        sample({
+          ts: AUG_23 + 2000,
+          path: "navigation.position",
+          source: "gps.a",
+          kind: "position",
+          value: { latitude: 61, longitude: 25 },
+        }),
+      );
+
+      const answer = await history.getValues(
+        all({ pathSpecs: [spec("navigation.position", "first")] }),
+      );
+
+      assert.deepEqual(
+        answer.values.map((v) => v.$source),
+        ["gps.a", "gps.b"],
+      );
+      assert.deepEqual(answer.data, [
+        [
+          iso(AUG_23),
+          { latitude: 61, longitude: 25 },
+          { latitude: 60, longitude: 24 },
+        ],
+      ]);
+    });
+
+    it("finds the sources of rows already rolled into the tree", async () => {
+      record(
+        sample({ ts: AUG_23 + 1000, path: "a.b", source: "tree", value: 1 }),
+        sample({
+          ts: AUG_23 + 1000,
+          path: "navigation.attitude#/roll",
+          source: "tree",
+          value: 2,
+        }),
+      );
+      const bound = store.rollBound();
+      assert.ok(bound !== null);
+      await roll({ dataDir: dir, maxRowid: bound.maxRowid, rollId: 1 });
+      store.deleteThrough(bound.maxRowid);
+      record(
+        sample({ ts: AUG_23 + 2000, path: "a.b", source: "store", value: 3 }),
+      );
+
+      const answer = await history.getValues(
+        all({
+          pathSpecs: [spec("a.b"), spec("navigation.attitude", "last")],
+        }),
+      );
+
+      assert.deepEqual(
+        answer.values.map((v) => [v.path, v.$source]),
+        [
+          ["a.b", "store"],
+          ["a.b", "tree"],
+          ["navigation.attitude", "tree"],
+        ],
+      );
+      assert.deepEqual(answer.data, [[iso(AUG_23), 3, 1, { roll: 2 }]]);
+    });
+
+    it("budgets the expanded columns in the bucket guard", async () => {
+      record(
+        sample({ ts: AUG_23 + 1000, path: "a.b", source: "n2k.0", value: 1 }),
+        sample({ ts: AUG_23 + 2000, path: "a.b", source: "n2k.9", value: 9 }),
+      );
+      const windowMs = MAX_SAMPLE_BUCKETS * 0.6 * 1000;
+
+      await history.getValues(
+        ask({ pathSpecs: [spec("a.b")], resolution: 1 }, windowMs),
+      );
+      await assert.rejects(
+        history.getValues(
+          all({ pathSpecs: [spec("a.b")], resolution: 1 }, windowMs),
+        ),
+        /across 2 paths/,
+      );
+    });
+  },
+);
+
 describe("getValues on an object path", { skip: NO_BUNDLED_EXTENSION }, () => {
   const iso = (ms: number) => new Date(ms).toISOString();
 
@@ -578,6 +788,31 @@ describe("an answer that did not fit", () => {
       ),
       /more than 100000 rows/,
     );
+  });
+
+  it("refuses a source list that did not fit rather than dropping columns", async () => {
+    const kinds: string[] = [];
+    const truncating = {
+      run: async (request: { kind: string }) => {
+        kinds.push(request.kind);
+        return {
+          rows: [["a.b", "n2k.0"]],
+          truncated: true,
+          wallMs: 1,
+          treeFiles: 0,
+          rssBytes: null,
+          peakRssBytes: null,
+        };
+      },
+    } as unknown as QueryRunner;
+
+    await assert.rejects(
+      createHistoryV2(truncating, "vessels.self").getValues(
+        ask({ pathSpecs: [spec("a.b")], resolution: 10, sourcePolicy: "all" }),
+      ),
+      /more than 100000 sources/,
+    );
+    assert.deepEqual(kinds, ["sources"]);
   });
 });
 
