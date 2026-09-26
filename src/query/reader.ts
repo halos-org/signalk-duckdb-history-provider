@@ -10,6 +10,7 @@ import {
   lockDownFileAccess,
 } from "../duckdb/extension.js";
 import { sqlLiteral } from "../duckdb/sql.js";
+import { POINTER } from "../pointer.js";
 import {
   dateDirectoryStart,
   liveTreeFiles,
@@ -556,9 +557,6 @@ function pathFilter(
   params.paths = listValue(wanted);
   return ["list_contains($paths, path)"];
 }
-
-/** Separates an object's path from a field's pointer in a stored name. */
-const POINTER = "#/";
 
 /**
  * The field rows of each requested path, as one key range per path.

@@ -1,20 +1,21 @@
+import { pointerPath } from "./pointer.js";
+
 /**
  * Decides what kind of value a delta carries, and therefore how the hot store
  * records it.
  *
  * Copied from `signalk-questdb-history-provider` with its suite. The routing
- * **behaviour is deliberately identical**, because Unit 4c has to reproduce
- * that provider's history contract; only the comments are retargeted from its
- * three QuestDB tables to this store's `value_kind` column. Fix bugs in both.
- * The sibling has since folded its copy into `src/ingestion/recorder.ts`, with
- * the pointer name in `src/storage/pointer.ts`; the rules are the same.
+ * **behaviour deliberately matches** the sibling's `src/ingestion/recorder.ts`,
+ * because Unit 4c has to reproduce that provider's history contract. The code
+ * is not a verbatim copy: it names fields through `pointer.ts`, and its
+ * comments describe this store's `value_kind` column rather than QuestDB
+ * tables. Fix bugs in both.
  *
  * The kinds are `number`, `string`, `boolean`, `position` and `identity`.
  * `flatten` is not a kind — it means the value is an object whose scalar
- * leaves are recorded one row each, under pointer names: the object's path,
- * `#`, and an RFC 6901 JSON pointer to the field (`navigation.attitude#/roll`).
- * `#` never occurs in a Signal K path, so a leaf cannot be mistaken for a real
- * scalar path, and the object can be put back together when it is read.
+ * leaves are recorded one row each, under pointer names
+ * (`navigation.attitude#/roll`, see `pointer.ts`), so the object can be put
+ * back together when it is read.
  */
 export type DeltaRoute =
   "number" | "string" | "boolean" | "position" | "flatten" | null;
@@ -142,10 +143,4 @@ export function flattenObjectValue(
     // Anything else — nested object, array, null, undefined — has no column.
   }
   return leaves;
-}
-
-/** The stored name of field `key` of the object at `path`. */
-export function pointerPath(path: string, key: string): string {
-  // `~` before `/`, or the `~` that `/` becomes would be escaped again.
-  return `${path}#/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`;
 }
