@@ -557,6 +557,40 @@ function pathFilter(
   return ["list_contains($paths, path)"];
 }
 
+/** Separates an object's path from a field's pointer in a stored name. */
+const POINTER = "#/";
+
+/**
+ * The field rows of each requested path, as one key range per path.
+ *
+ * An object's fields are stored as `path#/key`, and every such name sorts in
+ * `[path#/, path#0)` because `0` follows `/`. A range is written so the tree's
+ * Parquet min/max statistics on `path` can skip row groups — the merged hours
+ * are sorted by path, so they do — where a predicate on
+ * `split_part(path, …)` hides `path` from them and makes every values query
+ * read every row group. An `OR` of ranges is not pruned either, so each range
+ * is its own scan.
+ *
+ * A path that already holds `#` gets no range, which keeps the ranges
+ * disjoint; `NOT list_contains` drops a row the exact match already read, so
+ * no row is read twice. Needs `pathFilter` first.
+ */
+function fieldRanges(
+  paths: string[],
+  params: Record<string, DuckDBValue>,
+): string[] {
+  return paths
+    .filter((path) => !path.includes("#"))
+    .map((path, i) => {
+      params[`fieldsFrom${i}`] = `${path}#/`;
+      params[`fieldsTo${i}`] = `${path}#0`;
+      return (
+        `path >= $fieldsFrom${i} AND path < $fieldsTo${i} ` +
+        `AND NOT list_contains($paths, path)`
+      );
+    });
+}
+
 /**
  * Which files answer this range, and which of the store's rows they already
  * hold.
@@ -668,8 +702,12 @@ function compile(request: WindowedRequest, plan: Plan): Compiled | null {
     params.context = context;
     filters.push("context = $context");
   }
-  filters.push(...pathFilter(requestedPaths(request), params));
+  const scope = filters.join(" AND ");
+  const paths = requestedPaths(request);
+  filters.push(...pathFilter(paths, params));
   const where = filters.join(" AND ");
+  // A values request also reads the fields of any path that is an object.
+  const withFields = request.kind === "values" && paths.length > 0;
 
   const branches: string[] = [];
   if (plan.files.length > 0) {
@@ -678,13 +716,22 @@ function compile(request: WindowedRequest, plan: Plan): Compiled | null {
       .join(", ");
     // `union_by_name`: a file written by a build with a different column set
     // is read with the missing columns as NULL rather than failing the query.
-    branches.push(
-      `SELECT ${COLUMNS} FROM read_parquet([${list}], union_by_name = true) WHERE ${where}`,
-    );
+    const files = `read_parquet([${list}], union_by_name = true)`;
+    const fields = withFields ? fieldRanges(paths, params) : [];
+    for (const filter of [where, ...fields.map((f) => `${scope} AND ${f}`)]) {
+      branches.push(`SELECT ${COLUMNS} FROM ${files} WHERE ${filter}`);
+    }
   }
   if (plan.readStore) {
+    // One scan with every path in it rather than a scan per key range:
+    // `sqlite_scanner` pushes no predicate into SQLite (see `needsHotStore`),
+    // so each extra branch here would be another pass over the whole store.
+    const filter = withFields
+      ? `${scope} AND (list_contains($paths, path) OR ` +
+        `list_contains($paths, split_part(path, '${POINTER}', 1)))`
+      : where;
     branches.push(
-      `SELECT ${COLUMNS} FROM hot.sample WHERE ${where}${seam(plan.overlap, params)}`,
+      `SELECT ${COLUMNS} FROM hot.sample WHERE ${filter}${seam(plan.overlap, params)}`,
     );
   }
   if (branches.length === 0) return null;
@@ -710,9 +757,12 @@ function compile(request: WindowedRequest, plan: Plan): Compiled | null {
       params,
     };
   }
-  const column = request.kind === "paths" ? "path" : "context";
+  // A field is listed under its object's path: pointer names are a storage
+  // encoding, and no request can name one.
+  const column =
+    request.kind === "paths" ? `split_part(path, '${POINTER}', 1)` : "context";
   return {
-    text: `SELECT DISTINCT ${column} FROM (${union}) ORDER BY ${column}`,
+    text: `SELECT DISTINCT ${column} AS name FROM (${union}) ORDER BY name`,
     params,
   };
 }
@@ -762,40 +812,46 @@ function compileValues(
   const branchLimit = perSpecLimit(request);
 
   const branches = request.specs.map((spec, index) => {
-    const filters = [`path = $p${index}`];
     params[`p${index}`] = spec.path;
+    let bySource = "";
     if (spec.sourceRef !== undefined) {
       params[`s${index}`] = spec.sourceRef;
-      filters.push(`source = $s${index}`);
+      bySource = ` AND source = $s${index}`;
     }
-    const where = filters.join(" AND ");
+    const where = `path = $p${index}${bySource}`;
+    const noObject = `CAST(NULL AS ${OBJECT_TYPE}) AS obj`;
     // One `arg_min`/`arg_max` over a struct, never one per axis: two of them
     // tie-break independently when two sources record in the same
     // millisecond, and can return a latitude and a longitude the vessel was
     // never at simultaneously — which is the same fabrication the per-axis
     // aggregates are refused for.
     const position = `struct_pack(lat := value_lat, lon := value_lon)`;
+    let scalar: string;
     if (!bucketed || spec.aggregate === "raw") {
-      return (
+      scalar =
         `(SELECT ${index} AS spec, ts AS bucket, value_num AS num, ` +
-        `value_str AS str, value_kind AS kind, ${position} AS pos ` +
-        `FROM src WHERE ${where} ORDER BY ts LIMIT ${branchLimit})`
-      );
+        `value_str AS str, value_kind AS kind, ${position} AS pos, ${noObject} ` +
+        `FROM src WHERE ${where} ORDER BY ts LIMIT ${branchLimit})`;
+    } else {
+      // `first` and `last` are `arg_min`/`arg_max` over `ts`, because DuckDB's
+      // own `first()` and `last()` are undefined within a group.
+      const pick = spec.aggregate === "last" ? "arg_max" : "arg_min";
+      scalar =
+        `SELECT ${index} AS spec, ${bucketOf(bucketMs)} AS bucket, ` +
+        `${numericAggregate(spec.aggregate)} AS num, ` +
+        // Text is never averaged: a bucket takes the value in force at its
+        // end, which is what a state channel means, and the kind travels with
+        // it so a boolean is replayed as a boolean rather than as "true".
+        `arg_max(value_str, ts) AS str, arg_max(value_kind, ts) AS kind, ` +
+        `${pick}(${position}, ts) AS pos, ${noObject} ` +
+        `FROM src WHERE ${where} GROUP BY 1, 2`;
     }
-    // `first` and `last` are `arg_min`/`arg_max` over `ts`, because DuckDB's
-    // own `first()` and `last()` are undefined within a group.
-    const pick = spec.aggregate === "last" ? "arg_max" : "arg_min";
-    return (
-      `SELECT ${index} AS spec, ` +
-      `CAST(floor(ts / ${bucketMs}.0) AS BIGINT) * ${bucketMs} AS bucket, ` +
-      `${numericAggregate(spec.aggregate)} AS num, ` +
-      // Text is never averaged: a bucket takes the value in force at its end,
-      // which is what a state channel means, and the kind travels with it so
-      // a boolean is replayed as a boolean rather than as "true".
-      `arg_max(value_str, ts) AS str, arg_max(value_kind, ts) AS kind, ` +
-      `${pick}(${position}, ts) AS pos ` +
-      `FROM src WHERE ${where} GROUP BY 1, 2`
-    );
+    const object = objectBranch(index, spec.aggregate, {
+      bucketMs: bucketed ? bucketMs : null,
+      bySource,
+      limit: branchLimit,
+    });
+    return `${scalar} UNION ALL ${object}`;
   });
 
   return {
@@ -805,6 +861,88 @@ function compileValues(
       `FROM (${branches.join(" UNION ALL ")}) ORDER BY bucket, spec`,
     params,
   };
+}
+
+/** The SQL type of the `obj` column; see `ObjectField`. */
+const OBJECT_TYPE =
+  "STRUCT(key VARCHAR, num DOUBLE, str VARCHAR, kind VARCHAR)[]";
+
+/** The bucket a row's `ts` falls in: `floor(ts / width) * width`. */
+function bucketOf(bucketMs: number): string {
+  return `CAST(floor(ts / ${bucketMs}.0) AS BIGINT) * ${bucketMs}`;
+}
+
+/**
+ * A spec answered as an object: its field rows, `path#/key`, as one row per
+ * recorded delta or one per bucket carrying the fields of one delta.
+ *
+ * **Only when the path has no row of its own in the range.** A path with both
+ * is answered with its scalar series; `NOT EXISTS` makes the choice inside the
+ * statement, so the request stays one.
+ *
+ * A delta is the field rows of one `(ts, source)` — the recorder stamps every
+ * field of a delta with one `ts`, and the context is the request's. Two deltas
+ * from one source in one millisecond therefore read as one, which is accepted:
+ * this store keeps whole milliseconds and nothing orders rows within one.
+ *
+ * - Read raw (no bucket, or a client-side aggregate): one row per delta,
+ *   oldest first, and the limit counts deltas rather than rows.
+ * - `first` and `last`: the delta with the earliest or latest `ts` in the
+ *   bucket, every field of it and nothing from any other. A field that delta
+ *   did not carry is absent rather than taken from an older one.
+ * - Any other bucketed aggregate: a per-field average or extreme has no
+ *   general meaning — an angle, a vector component and a coordinate average
+ *   differently — so nothing is computed. One row with an empty field list
+ *   says the path is an object, and the caller refuses the request.
+ */
+function objectBranch(
+  index: number,
+  aggregate: ValueAggregate,
+  options: { bucketMs: number | null; bySource: string; limit: number },
+): string {
+  const { bucketMs, bySource, limit } = options;
+  const p = `$p${index}`;
+  const fieldRows =
+    `SELECT ts, source, substr(path, length(${p}) + ${POINTER.length + 1}) AS key, ` +
+    `value_num, value_str, value_kind FROM src ` +
+    `WHERE starts_with(path, ${p} || '${POINTER}')${bySource} ` +
+    `AND NOT EXISTS (SELECT 1 FROM src WHERE path = ${p}${bySource})`;
+  const fields =
+    `CAST(list(struct_pack(key := key, num := value_num, str := value_str, ` +
+    `kind := value_kind)) AS ${OBJECT_TYPE}) AS obj`;
+  const head = (bucket: string) =>
+    `SELECT ${index} AS spec, ${bucket} AS bucket, ` +
+    `CAST(NULL AS DOUBLE) AS num, CAST(NULL AS VARCHAR) AS str, ` +
+    `CAST(NULL AS VARCHAR) AS kind, ` +
+    `CAST(NULL AS STRUCT(lat DOUBLE, lon DOUBLE)) AS pos`;
+
+  if (bucketMs === null || aggregate === "raw") {
+    return (
+      `(${head("ts")}, ${fields} FROM (${fieldRows}) ` +
+      `GROUP BY ts, source ORDER BY ts LIMIT ${limit})`
+    );
+  }
+
+  if (aggregate !== "first" && aggregate !== "last") {
+    return (
+      `(${head("ts")}, CAST([] AS ${OBJECT_TYPE}) AS obj ` +
+      `FROM (${fieldRows}) LIMIT 1)`
+    );
+  }
+
+  // Which delta each bucket keeps, then that delta's rows. The pick is one
+  // `arg_min`/`arg_max` over a struct, so its `ts` and its source come from
+  // the same row; the struct is never null, where a bare source can be.
+  const pick = aggregate === "last" ? "arg_max" : "arg_min";
+  const bucketed = `SELECT *, ${bucketOf(bucketMs)} AS bucket FROM (${fieldRows})`;
+  const chosen =
+    `SELECT bucket, ${pick}(struct_pack(t := ts, s := source), ts) AS d ` +
+    `FROM (${bucketed}) GROUP BY bucket`;
+  return (
+    `${head("f.bucket")}, ${fields} FROM (${bucketed}) f ` +
+    `JOIN (${chosen}) c ON f.bucket = c.bucket AND f.ts = c.d.t ` +
+    `AND f.source IS NOT DISTINCT FROM c.d.s GROUP BY f.bucket`
+  );
 }
 
 /** The bucket reduction for a numeric series. */

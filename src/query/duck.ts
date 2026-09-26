@@ -69,6 +69,11 @@ export const RANGE_COLUMNS = [
  * ever set, and which one is not known before the query runs. That is what
  * replaces the sibling provider's "query the numeric table, and if it came
  * back empty query the string table" — here they are one table and one pass.
+ *
+ * `obj` is set instead when the series is an object path, stored as one row
+ * per field under `path#/key`: the fields of one recorded delta, as a list of
+ * `ObjectField`. An empty list marks an object path read with an aggregate
+ * that selects no delta, which the caller refuses.
  */
 export const VALUE_COLUMNS = [
   "spec",
@@ -78,7 +83,17 @@ export const VALUE_COLUMNS = [
   "kind",
   "lat",
   "lon",
+  "obj",
 ] as const;
+
+/** One field of an object row. At most one of `num` and `str` is set. */
+export interface ObjectField {
+  /** The pointer after `#/`, still escaped as it was stored. */
+  key: string;
+  num: number | null;
+  str: string | null;
+  kind: string | null;
+}
 
 /**
  * How a bucket is reduced.
