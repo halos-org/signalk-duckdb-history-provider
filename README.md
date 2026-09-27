@@ -199,6 +199,21 @@ a dotted field gets no data recorded since the upgrade: new data is only
 reachable through the object path. A rename of the old rows, if wanted, is
 [signalk-duckdb-history-provider#41](https://github.com/halos-org/signalk-duckdb-history-provider/issues/41).
 
+## Text values and positions
+
+Text values (strings and booleans) and `navigation.position` only take the v2
+methods that pick a recorded value: `first`, `last` and `middle_index`. With a
+`resolution`, `average`, `min`, `max` and `mid` fail the request with
+`Aggregate average does not apply to text path <path>: use first, last or middle_index`
+(or `position path` for `navigation.position`), and `sma` and `ema` fail with
+or without one. Without a `resolution` every other method returns the recorded
+values, as it does for numbers. An unknown method name fails the request with
+`Unknown aggregate <name>`.
+
+The server fills in `first` for `navigation.position` and `average` for every
+other path when a request names no method, so a text path requested with a
+`resolution` and no method fails.
+
 ## Reading one source
 
 Every row keeps the source that recorded it. Append `|<sourceRef>` to a path in

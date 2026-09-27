@@ -847,15 +847,17 @@ function compileValues(
       // `first` and `last` are `arg_min`/`arg_max` over `ts`, because DuckDB's
       // own `first()` and `last()` are undefined within a group.
       const pick = spec.aggregate === "last" ? "arg_max" : "arg_min";
+      // Text is never averaged: `first` and `last` pick a recorded value and
+      // every other aggregate is refused once the rows show the path is text.
+      // The value and its kind are picked as one struct, like the position,
+      // so a tie on `ts` cannot pair one row's text with another row's kind.
       scalar =
-        `SELECT ${index} AS spec, ${bucketOf(bucketMs)} AS bucket, ` +
+        `SELECT spec, bucket, num, txt.s AS str, txt.k AS kind, pos, obj ` +
+        `FROM (SELECT ${index} AS spec, ${bucketOf(bucketMs)} AS bucket, ` +
         `${numericAggregate(spec.aggregate)} AS num, ` +
-        // Text is never averaged: a bucket takes the value in force at its
-        // end, which is what a state channel means, and the kind travels with
-        // it so a boolean is replayed as a boolean rather than as "true".
-        `arg_max(value_str, ts) AS str, arg_max(value_kind, ts) AS kind, ` +
+        `${pick}(struct_pack(s := value_str, k := value_kind), ts) AS txt, ` +
         `${pick}(${position}, ts) AS pos, ${noObject} ` +
-        `FROM src WHERE ${where} GROUP BY 1, 2`;
+        `FROM src WHERE ${where} GROUP BY 1, 2)`;
     }
     const object = objectBranch(index, spec.aggregate, {
       bucketMs: bucketed ? bucketMs : null,
