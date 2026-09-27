@@ -60,7 +60,20 @@ export function effectiveResolution(resolution: number): number {
 
 /** Which aggregates this side computes, because a bucket cannot. */
 function needsClientSideAggregation(method: string): boolean {
-  return method === "middle_index" || method === "sma" || method === "ema";
+  return method === "middle_index" || isSmoothing(method);
+}
+
+function isSmoothing(method: string): boolean {
+  return method === "sma" || method === "ema";
+}
+
+/**
+ * Whether a series is read as raw rows. Bucketed, a moving average smooths
+ * the bucket averages, as the sibling provider does, so only middle_index
+ * still reads raw.
+ */
+function readsRaw(method: string, bucketed: boolean): boolean {
+  return method === "middle_index" || (isSmoothing(method) && !bucketed);
 }
 
 /** The aggregates the engine can reduce a bucket with. */
@@ -120,8 +133,12 @@ function refusal(aggregate: string, kind: string, path: string): Error {
  * storage is local file read and write rather than a database's own tables.
  * Names outside the set are refused before this is reached.
  */
-function toQueryAggregate(method: AggregateMethod): ValueAggregate {
-  if (needsClientSideAggregation(method)) return "raw";
+function toQueryAggregate(
+  method: AggregateMethod,
+  bucketed: boolean,
+): ValueAggregate {
+  if (readsRaw(method, bucketed)) return "raw";
+  if (isSmoothing(method)) return "average";
   return method as ValueAggregate;
 }
 
@@ -210,8 +227,8 @@ function normalizeContext(context: string, selfContext: string): string {
  *
  * Counted on the range the caller asked for rather than on what comes back —
  * a budget that only refuses after the work is done is not a budget. Only
- * specs that bucket contribute: a client-side aggregate reads raw rows under
- * their own limit.
+ * specs that bucket contribute: middle_index reads raw rows under their own
+ * limit.
  */
 function guardBuckets(
   specs: PathSpec[],
@@ -220,7 +237,7 @@ function guardBuckets(
   rangeMs: number,
 ): void {
   const bucketedSpecs = specs.filter(
-    (spec) => !needsClientSideAggregation(spec.aggregate),
+    (spec) => !readsRaw(spec.aggregate, true),
   ).length;
   if (bucketSeconds <= 0 || bucketedSpecs === 0) return;
   const buckets = Math.ceil(rangeMs / 1000 / bucketSeconds) * bucketedSpecs;
@@ -366,7 +383,7 @@ export function createHistoryV2(
         source === undefined ? spec.sourceRef || undefined : source;
       return {
         path: spec.path,
-        aggregate: toQueryAggregate(spec.aggregate),
+        aggregate: toQueryAggregate(spec.aggregate, bucketSeconds > 0),
         ...(sourceRef !== undefined ? { sourceRef } : {}),
       };
     });
@@ -419,14 +436,13 @@ export function createHistoryV2(
     let firstBucket = Infinity;
     let lastBucket = -Infinity;
 
-    // Only a bucketed spec reports bucket boundaries. A client-side aggregate
-    // is read raw, so its rows carry their own timestamps, and a walk started
-    // from one of those would land between boundaries at every step and
-    // fabricate an all-null row for each.
+    // Only a bucketed spec reports bucket boundaries. A raw read carries its
+    // own timestamps, and a walk started from one of those would land between
+    // boundaries at every step and fabricate an all-null row for each.
     const onGrid = new Set(
       pathSpecs
         .map((spec: PathSpec, index: number) => ({ spec, index }))
-        .filter(({ spec }) => !needsClientSideAggregation(spec.aggregate))
+        .filter(({ spec }) => !readsRaw(spec.aggregate, bucketSeconds > 0))
         .map(({ index }) => index),
     );
 
@@ -481,12 +497,23 @@ export function createHistoryV2(
       }
     }
 
-    // The client-side aggregates run over their series' raw rows, in order.
+    // The client-side aggregates run over their series in order: raw rows, or
+    // for a bucketed moving average every bucket from its first to its last.
+    // The engine returns only buckets that hold something, and the empty ones
+    // are nulls the smoothing has to see, as the sibling's FILL(NULL) rows are.
     for (const [index, spec] of pathSpecs.entries()) {
       if (!needsClientSideAggregation(spec.aggregate)) continue;
       const series = bySpec.get(index);
       if (series === undefined) continue;
-      const stamps = [...series.keys()].sort((a, b) => a - b);
+      let stamps = [...series.keys()].sort((a, b) => a - b);
+      if (onGrid.has(index) && stamps.length > 0) {
+        const step = bucketSeconds * 1000;
+        const grid: number[] = [];
+        for (let at = stamps[0]; at <= stamps[stamps.length - 1]; at += step) {
+          grid.push(at);
+        }
+        stamps = grid;
+      }
       if (spec.aggregate === "middle_index") {
         // The middle recorded value, whatever it is: a number, text, a
         // position, or an object delta whole.

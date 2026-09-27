@@ -98,8 +98,9 @@ export interface ObjectField {
 /**
  * How a bucket is reduced.
  *
- * `raw` returns the rows themselves, for the aggregates the API defines as
- * client-side: a moving average cannot be computed a bucket at a time.
+ * `raw` returns the rows themselves, for `middle_index` and for a moving
+ * average read without a bucket. A bucketed moving average reads `average`
+ * and is smoothed over the buckets by the caller.
  */
 export type ValueAggregate =
   "average" | "min" | "max" | "first" | "last" | "mid" | "raw";
