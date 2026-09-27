@@ -6,7 +6,11 @@ import { join } from "node:path";
 import { Temporal } from "@js-temporal/polyfill";
 import type { HistoryApi, ValuesRequest } from "@signalk/server-api/history";
 import { DATA_LAYOUT } from "../data-dir.js";
-import { createHistoryV2, MAX_SAMPLE_BUCKETS } from "../history-v2.js";
+import {
+  computeSMA,
+  createHistoryV2,
+  MAX_SAMPLE_BUCKETS,
+} from "../history-v2.js";
 import { QueryRunner } from "../query/duck.js";
 import { roll } from "../roll/roll.js";
 import { writerPaths } from "../writer/contract.js";
@@ -209,32 +213,74 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
     ]);
   });
 
-  it("computes a moving average over the raw series", async () => {
+  it("computes a moving average over the raw series without a resolution", async () => {
     for (let i = 0; i < 4; i += 1) {
       record(sample({ ts: AUG_23 + i * 1000, path: "a.b", value: i * 10 }));
     }
 
     const answer = await history.getValues(
-      ask({
-        pathSpecs: [spec("a.b", "sma", { parameter: ["2"] })],
-        resolution: 10,
-      }),
+      ask({ pathSpecs: [spec("a.b", "sma", { parameter: ["2"] })] }),
     );
 
-    // A two-sample window over 0, 10, 20, 30 — at the raw timestamps, because
-    // a moving average is not a bucket reduction.
+    // A two-sample window over 0, 10, 20, 30, at the raw timestamps.
     assert.deepEqual(
       answer.data.map((row) => row[1]),
       [0, 5, 15, 25],
     );
   });
 
+  it("smooths the bucket averages with a resolution", async () => {
+    // Bucket averages 5, 20, nothing, 40. The empty bucket inside the series
+    // is a null the smoothing sees, as the sibling's FILL(NULL) row is: sma
+    // emits null there and ema repeats its previous value.
+    record(
+      sample({ ts: AUG_23 + 1000, path: "a.b", value: 0 }),
+      sample({ ts: AUG_23 + 2000, path: "a.b", value: 10 }),
+      sample({ ts: AUG_23 + 12_000, path: "a.b", value: 20 }),
+      sample({ ts: AUG_23 + 31_000, path: "a.b", value: 40 }),
+    );
+
+    const answer = await history.getValues(
+      ask({
+        pathSpecs: [
+          spec("a.b", "sma", { parameter: ["2"] }),
+          spec("a.b", "ema", { parameter: ["0.5"] }),
+        ],
+        resolution: 10,
+      }),
+    );
+
+    assert.deepEqual(answer.data, [
+      [new Date(AUG_23).toISOString(), 5, 5],
+      [new Date(AUG_23 + 10_000).toISOString(), 12.5, 12.5],
+      [new Date(AUG_23 + 20_000).toISOString(), null, 12.5],
+      [new Date(AUG_23 + 30_000).toISOString(), 30, 26.25],
+    ]);
+    assert.deepEqual(
+      answer.values.map((v) => v.method),
+      ["sma", "ema"],
+    );
+  });
+
+  it("budgets a downsampled moving average in the bucket guard", async () => {
+    await assert.rejects(
+      history.getValues(
+        ask(
+          {
+            pathSpecs: [spec("a.b", "sma", { parameter: ["5"] })],
+            resolution: 1,
+          },
+          365 * DAY,
+        ),
+      ),
+      /coarser resolution/,
+    );
+  });
+
   it("fills the gaps on the bucket grid when one spec is not on it", async () => {
-    // A client-side aggregate is read raw, so its rows carry their own
-    // timestamps rather than bucket boundaries. Taking the fill's bounds over
-    // those started the walk between two boundaries, and every step after it
-    // landed on a stamp no series holds — an all-null row apiece, up to one
-    // per bucket over the whole range.
+    // Only bucketed specs bound the fill. middle_index is read raw, so its
+    // stamps fall between bucket boundaries, and a walk started from one would
+    // land on a stamp no series holds at every step: an all-null row per bucket.
     record(
       sample({ ts: AUG_23 + 1000, path: "c.d", value: 0 }),
       sample({ ts: AUG_23 + 2000, path: "c.d", value: 10 }),
@@ -245,7 +291,7 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
 
     const answer = await history.getValues(
       ask({
-        pathSpecs: [spec("a.b"), spec("c.d", "sma", { parameter: ["2"] })],
+        pathSpecs: [spec("a.b"), spec("c.d", "middle_index")],
         resolution: 10,
       }),
     );
@@ -254,9 +300,9 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
     // walk never starts from `c.d`'s 1 s. Bounding it over both series instead
     // filled 11 s and 21 s, which no series holds and no boundary names.
     assert.deepEqual(answer.data, [
-      [new Date(AUG_23 + 1000).toISOString(), null, 0],
-      [new Date(AUG_23 + 2000).toISOString(), null, 5],
-      [new Date(AUG_23 + 3000).toISOString(), null, 15],
+      [new Date(AUG_23 + 1000).toISOString(), null, null],
+      [new Date(AUG_23 + 2000).toISOString(), null, 10],
+      [new Date(AUG_23 + 3000).toISOString(), null, null],
       [new Date(AUG_23 + 10_000).toISOString(), 7, null],
       [new Date(AUG_23 + 20_000).toISOString(), null, null],
       [new Date(AUG_23 + 30_000).toISOString(), 9, null],
@@ -273,10 +319,7 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
     const over = async (aggregate: string, parameter: string[] | undefined) =>
       (
         await history.getValues(
-          ask({
-            pathSpecs: [spec("a.b", aggregate, { parameter })],
-            resolution: 10,
-          }),
+          ask({ pathSpecs: [spec("a.b", aggregate, { parameter })] }),
         )
       ).data.map((row) => row[1]);
 
@@ -670,9 +713,9 @@ describe(
       }
     });
 
-    it("refuses a downsampled arithmetic aggregate on a text path", async () => {
+    it("refuses a downsampled arithmetic or smoothing aggregate on a text path", async () => {
       states();
-      for (const aggregate of ["average", "min", "max", "mid"]) {
+      for (const aggregate of ["average", "min", "max", "mid", "sma", "ema"]) {
         await assert.rejects(
           history.getValues(
             ask({ pathSpecs: [spec("s.t", aggregate)], resolution: 10 }),
@@ -983,6 +1026,27 @@ describe("getValues on an object path", { skip: NO_BUNDLED_EXTENSION }, () => {
       );
       assert.equal(answer.data.length, 1, aggregate);
     }
+  });
+});
+
+/**
+ * Linear smoothing of 200,000 points takes milliseconds; the per-point window
+ * sum took 37 s in the sibling provider.
+ */
+const LINEAR_SMOOTHING_BUDGET_MS = 1000;
+
+describe("computeSMA", () => {
+  // The guard admits a million buckets and the window is the caller's. Timed
+  // rather than given a test timeout: the smoothing is synchronous, so a
+  // timeout could not fire until it had finished.
+  it("smooths in time linear in the series length", () => {
+    const count = 200_000;
+    const values = Array.from({ length: count }, (_, i) => i);
+    const started = performance.now();
+    const smoothed = computeSMA(values, count / 2);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < LINEAR_SMOOTHING_BUDGET_MS, `${elapsed} ms`);
+    assert.equal(smoothed[count - 1], (count / 2 + count - 1) / 2);
   });
 });
 
