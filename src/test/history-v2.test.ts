@@ -6,7 +6,11 @@ import { join } from "node:path";
 import { Temporal } from "@js-temporal/polyfill";
 import type { HistoryApi, ValuesRequest } from "@signalk/server-api/history";
 import { DATA_LAYOUT } from "../data-dir.js";
-import { createHistoryV2, MAX_SAMPLE_BUCKETS } from "../history-v2.js";
+import {
+  computeSMA,
+  createHistoryV2,
+  MAX_SAMPLE_BUCKETS,
+} from "../history-v2.js";
 import { QueryRunner } from "../query/duck.js";
 import { roll } from "../roll/roll.js";
 import { writerPaths } from "../writer/contract.js";
@@ -1022,6 +1026,27 @@ describe("getValues on an object path", { skip: NO_BUNDLED_EXTENSION }, () => {
       );
       assert.equal(answer.data.length, 1, aggregate);
     }
+  });
+});
+
+/**
+ * Linear smoothing of 200,000 points takes milliseconds; the per-point window
+ * sum took 37 s in the sibling provider.
+ */
+const LINEAR_SMOOTHING_BUDGET_MS = 1000;
+
+describe("computeSMA", () => {
+  // The guard admits a million buckets and the window is the caller's. Timed
+  // rather than given a test timeout: the smoothing is synchronous, so a
+  // timeout could not fire until it had finished.
+  it("smooths in time linear in the series length", () => {
+    const count = 200_000;
+    const values = Array.from({ length: count }, (_, i) => i);
+    const started = performance.now();
+    const smoothed = computeSMA(values, count / 2);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < LINEAR_SMOOTHING_BUDGET_MS, `${elapsed} ms`);
+    assert.equal(smoothed[count - 1], (count / 2 + count - 1) / 2);
   });
 });
 

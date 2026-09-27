@@ -168,17 +168,26 @@ function emaAlpha(parameter: string | undefined): number {
   return alpha > 0 && alpha <= 1 ? alpha : EMA_ALPHA;
 }
 
-function computeSMA(values: (number | null)[], n: number): (number | null)[] {
+export function computeSMA(
+  values: (number | null)[],
+  n: number,
+): (number | null)[] {
+  // A running sum over the non-null values, so the cost is linear in the
+  // series whatever window the caller asks for: the bucket guard admits a
+  // million buckets.
   const result: (number | null)[] = [];
-  const window: number[] = [];
+  const seen: number[] = [];
+  let oldest = 0;
+  let sum = 0;
   for (const v of values) {
     if (v === null) {
       result.push(null);
       continue;
     }
-    window.push(v);
-    if (window.length > n) window.shift();
-    result.push(window.reduce((a, b) => a + b, 0) / window.length);
+    seen.push(v);
+    sum += v;
+    if (seen.length - oldest > n) sum -= seen[oldest++];
+    result.push(sum / (seen.length - oldest));
   }
   return result;
 }
