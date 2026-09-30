@@ -1,21 +1,41 @@
-name: Main Branch CI/CD
+name: Main branch release
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+# Required: release-version.yml computes the next revision from existing tags,
+# so two concurrent runs would compute the same one.
 concurrency:
   group: ${{ github.repository }}-main-release
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-release:
-    uses: halos-org/shared-workflows/.github/workflows/build-release.yml@main
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/run-tests
+
+  version:
+    needs: tests
+    uses: halos-org/shared-workflows/.github/workflows/release-version.yml@v1.0.0-rc.1
+
+  # Notes-only releases: publishing the draft starts release.yml.
+  stage-release:
+    needs: version
+    permissions:
+      contents: write
+    uses: halos-org/shared-workflows/.github/workflows/stage-release.yml@v1.0.0-rc.1
     with:
       package-name: signalk-duckdb-history-provider
       package-description: "History provider for Signal K: a SQLite hot store rolled into a Parquet tree, queried with DuckDB"
-      build-deb: false
+      debian-version: ${{ needs.version.outputs.debian-version }}
+      prerelease-tag: ${{ needs.version.outputs.prerelease-tag }}
+      stable-tag: ${{ needs.version.outputs.stable-tag }}
